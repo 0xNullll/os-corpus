@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import struct
@@ -143,6 +144,64 @@ class VersionTests(unittest.TestCase):
         if not ntdll.exists():
             self.skipTest("no ntdll.dll on this host")
         self.assertRegex(pelib.version_of(str(ntdll))["file_version"], r"^\d+\.\d+\.\d+\.\d+$")
+
+
+class ProgressTests(unittest.TestCase):
+    class Stream(io.StringIO):
+        def __init__(self, tty):
+            super().__init__()
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    def progress(self, tty, enabled=True):
+        stream = self.Stream(tty)
+        progress = pelib.Progress(enabled, stream)
+        progress.LIVE_SECONDS = progress.LOG_SECONDS = 0
+        return progress, stream
+
+    def test_log_lines_into_a_pipe(self):
+        progress, stream = self.progress(tty=False)
+        progress.tick(lambda: "scan: 1 files")
+        progress.tick(lambda: "scan: 2 files")
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[1].startswith("[i] scan: 2 files, "))
+        self.assertNotIn("\r", stream.getvalue())
+
+    def test_one_redrawn_line_on_a_console(self):
+        progress, stream = self.progress(tty=True)
+        progress.tick(lambda: "place: 1/2 files")
+        progress.tick(lambda: "place: 2/2 files")
+        progress.clear()
+        self.assertEqual(stream.getvalue().count("\r"), 4)
+        self.assertNotIn("\n", stream.getvalue())
+
+    def test_render_only_when_printed(self):
+        calls = []
+        progress, stream = self.progress(tty=False, enabled=False)
+        progress.tick(lambda: calls.append(1) or "x")
+        quiet = pelib.Progress(True, self.Stream(False))   # default 10 s interval
+        quiet.tick(lambda: calls.append(1) or "x")
+        self.assertEqual((calls, stream.getvalue()), ([], ""))
+
+    def test_formats(self):
+        self.assertEqual([pelib.duration(s) for s in (5.25, 245, 3725)], ["5.2s", "4m05s", "1h02m"])
+        self.assertEqual(pelib.eta(10, 25, 100), ", ETA 30.0s")
+        self.assertEqual(pelib.eta(10, 0, 100), "")
+        self.assertEqual(pelib.byte_string(3 * 1024 ** 3), "3.0 GB")
+
+
+class ParallelTests(unittest.TestCase):
+    def test_ordered_map_keeps_input_order(self):
+        items = list(range(200))
+        for jobs in (1, 4):
+            got = list(pelib.ordered_map(lambda x: x * x, iter(items), jobs, window=7))
+            self.assertEqual(got, [(x, x * x) for x in items])
+
+    def test_default_jobs(self):
+        self.assertTrue(1 <= pelib.default_jobs() <= pelib.MAX_DEFAULT_JOBS)
 
 
 class LongPathTests(unittest.TestCase):

@@ -180,6 +180,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Internal PLAN.md
+PLAN.md
+
+# Github desktop app state folder
+state/
+
 # os-corpus working data and media never belong in the tool repo.
 /corpus/
 /manifests/

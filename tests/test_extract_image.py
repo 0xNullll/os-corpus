@@ -73,6 +73,47 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(source["manifestSha256"],
                          pelib.sha256_file(str(self.report / "manifest.sha256")))
 
+        # The result is the last line, after the time line; the log holds the same lines.
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines[-1].startswith("[+] extract-image: build, 9 files, verified, in "),
+                        lines[-1])
+        self.assertTrue(lines[-2].startswith("[i] time        scan "), lines[-2])
+        logs = list((self.root / "corpus" / "logs").glob("build-*.log"))
+        self.assertEqual(len(logs), 1)
+        log = logs[0].read_text(encoding="utf-8")
+        self.assertIn("[+] collect: 9 files stored", log)
+        self.assertIn("[+] verify: ", log)
+        self.assertEqual(log.splitlines()[-1], lines[-1])
+
+    def test_no_log(self):
+        result = wrapper("-Directory", self.img, "-Out", self.out, "-Label", "build", "-NoLog")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / "corpus" / "logs").exists())
+
+    def test_edition_argument_checks(self):
+        cases = [
+            (("-Directory", self.img, "-Edition", "Windows 11 Pro"), "needs an image source"),
+            (("-Iso", self.root / "x.iso", "-Edition", "Windows 11 Pro", "-Index", "6"),
+             "both pick the image"),
+        ]
+        for args, message in cases:
+            with self.subTest(message):
+                result = wrapper(*args, "-Out", self.out)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_relative_paths_follow_the_powershell_location(self):
+        # An elevated window starts in C:\Windows\system32 and the user cd's to the repo: `cd`
+        # moves $PWD but not the process directory, which is where the subprocess starts here.
+        command = ("Set-Location -LiteralPath '{root}'; "
+                   "& '{wrapper}' -Directory .\\img -Out .\\corpus\\build -Label build -Python '{py}'; "
+                   "exit $LASTEXITCODE").format(root=self.root, wrapper=WRAPPER, py=sys.executable)
+        result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                                 "Bypass", "-Command", command],
+                                capture_output=True, text=True, cwd=str(Path(WRAPPER).parent))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.report / "manifest.sha256").exists())
+
     def test_delete_source_needs_verification(self):
         result = wrapper("-Iso", self.root / "x.iso", "-Out", self.out, "-DeleteSource", "-NoVerify")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

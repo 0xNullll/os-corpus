@@ -33,7 +33,7 @@ class VerifyTests(unittest.TestCase):
         img = build_image(self.root / "img")
         self.out = self.root / "corpus" / "build"
         self.report = self.root / "corpus" / "manifests" / "build"
-        result = run(COLLECT, img, self.out, "--index", "none")
+        result = run(COLLECT, img, self.out, "--link-root", "none")
         self.assertEqual(result.returncode, 0, output(result))
 
     def tearDown(self):
@@ -59,7 +59,18 @@ class VerifyTests(unittest.TestCase):
     # -- passing -----------------------------------------------------------
 
     def test_passes(self):
-        self.assertCode(self.verify(), 0, "[+] verify:", "[+] hashes", "[+] modules")
+        self.assertCode(self.verify(), 0, "[+] verify:", "[>] re-hashing 9 files (",
+                        "[+] hashes      9 verified in", "[+] modules")
+
+    def test_parallel_hashing(self):
+        self.assertCode(self.verify("--jobs", "1"), 0)
+        self.assertCode(self.verify("--jobs", "4"), 0)
+        victim = self.out / "Windows/System32/b.dll"
+        data = bytearray(victim.read_bytes())
+        data[-1] ^= 0xFF
+        victim.write_bytes(bytes(data))
+        self.assertCode(self.verify("--jobs", "4"), 4, "Windows/System32/b.dll")
+        self.assertCode(self.verify("--jobs", "0"), 2)
 
     def test_fast_skips_hashes(self):
         self.assertCode(self.verify("--fast"), 0, "[~] hashes      skipped (--fast)")

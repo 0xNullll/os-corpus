@@ -8,6 +8,7 @@ ever sees a directory.
     python collect_pes.py <image-dir> <out-dir> --dry-run       scan and print the counts, write nothing
     python collect_pes.py <image-dir> <out-dir> --resume        continue an interrupted run
     python collect_pes.py <image-dir> <out-dir> --arch x64,x86  keep only these architectures
+    python collect_pes.py <image-dir> <out-dir> --jobs 4        hash 4 files at a time
 
 Input
     Every file under <image-dir> whose header is a valid PE (pelib.py), whatever its extension.
@@ -25,14 +26,14 @@ Selection
       collisions.tsv.
 
 Output
-    <out>/<image path>                  every stored file, hardlinked when an earlier run stored
-                                        the same bytes (shared index, default <out>/../.hash-index.tsv)
+    <out>/<image path>                  every stored file, hardlinked when another completed build
+                                        under the link root (default <out>/..) has the same bytes
     <report>/manifest.sha256            sha256sum format, one line per stored file; written last
     <report>/modules.tsv                one row per stored file, with its classification
     <report>/duplicates.tsv             paths not stored because their bytes are stored elsewhere
     <report>/collisions.tsv             paths found twice
-    <report>/summary.json               counts, bytes, histograms, options, timing
-    <report>/scan-cache.tsv             resume accelerator, not evidence
+    <report>/summary.json               counts, bytes, histograms, options, phase times
+    <report>/scan-cache.tsv             resume accelerator (digests and module info), not evidence
     <report> defaults to <out>/../manifests/<out-name>. USAGE.md has every column.
 
 Exit code 0 on success, 1 on an error, 2 on bad usage, 3 when collisions.tsv is not empty
@@ -48,6 +49,7 @@ import os
 import shutil
 import sys
 import time
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
@@ -63,6 +65,7 @@ EXIT_COLLISIONS = 3
 EXIT_INTERRUPTED = 130
 
 SUMMARY_SCHEMA = "os-corpus/summary/1"
+CACHE_SCHEMA = "os-corpus/scan-cache/2"
 
 # Report columns. verify_corpus.py keeps its own copy on purpose; the tests check they agree.
 MODULES_HEADER = ("name", "arch", "canonical", "kind", "location", "format", "machine", "dll",
@@ -76,6 +79,11 @@ REPORT_SCHEMAS = {
     "duplicates.tsv": "os-corpus/duplicates/1",
     "collisions.tsv": "os-corpus/collisions/1",
 }
+
+# pe_info fields a modules.tsv row and the selection need; scan-cache.tsv keeps them per stored
+# file, so a resumed run does not read every version resource again.
+CACHE_INFO_KEYS = ("magic", "machine", "dll", "clr", "embedded_signature", "subsystem", "kind",
+                   "file_version", "product_version")
 
 # Location classes, most authoritative first; a file's rank is its index here.
 LOCATIONS = ("system32", "syswow64", "systemapps", "programfiles", "winsxs", "driverstore",
@@ -101,11 +109,14 @@ DEFAULT_EXCLUDES = (
     "**/swapfile.sys",
 )
 
+# Earlier versions kept the link index in this file under the corpus root; it is now rebuilt from
+# the manifests, and a leftover copy is only reported.
+OBSOLETE_INDEX = ".hash-index.tsv"
+
 # Suffix of the temporary name a file is written under before it is renamed into place.
 TMP_SUFFIX = ".os-corpus-tmp"
 
 MAX_SHOWN = 20
-PROGRESS_SECONDS = 2.0
 
 
 # ---- OUTPUT ----
@@ -113,6 +124,10 @@ PROGRESS_SECONDS = 2.0
 class Log:
     def __init__(self, quiet):
         self.quiet = quiet
+
+    def step(self, message):
+        if not self.quiet:
+            print("[>] %s" % message)
 
     def info(self, message):
         if not self.quiet:
@@ -140,12 +155,7 @@ def fail(message, code=EXIT_ERROR):
     return code
 
 
-def byte_string(n):
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return "%d B" % n if unit == "B" else "%.1f %s" % (n, unit)
-        n /= 1024.0
-    return "%d B" % n
+byte_string = pelib.byte_string
 
 
 # ---- PATHS ----
@@ -234,7 +244,7 @@ class Record:
     size: int
     digest: str
     location: str
-    info: Optional[dict] = None    # pelib.pe_info of the source; loaded for stored files only
+    info: Optional[dict] = None    # pe_info of the source; loaded (or cached) for stored files
     canonical: bool = False
 
     @property
@@ -249,6 +259,14 @@ class Record:
 def make_record(rel, size, digest, arch):
     return Record(rel=rel, name=rel.rsplit("/", 1)[-1], arch=arch, size=size, digest=digest,
                   location=location(rel))
+
+
+# One scan-cache.tsv row; info is the CACHE_INFO_KEYS subset of pe_info, or None.
+CacheEntry = namedtuple("CacheEntry", "digest arch size mtime info")
+
+
+def cache_info(info):
+    return {k: info[k] for k in CACHE_INFO_KEYS if k in info} if info else None
 
 
 # ---- SMALL FILES ----
@@ -267,16 +285,29 @@ def read_manifest(path):
 
 
 def read_cache(path):
+    """{rel: CacheEntry}. Module info is used only when the header names this cache schema and
+    the current pelib.INFO_VERSION; digests are always usable (5-column rows of an older cache
+    included)."""
     cache = {}
+    info_valid = False
     try:
         with open(lp(path), "r", encoding="utf-8") as f:
             for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) != 5:
+                line = line.rstrip("\n")
+                if line.startswith("#"):
+                    info_valid = line.split("\t")[1:] == [CACHE_SCHEMA, "info/%d" % pelib.INFO_VERSION]
                     continue
-                digest, arch, size, mtime, rel = parts
+                parts = line.split("\t")
+                if len(parts) == 5:
+                    digest, arch, size, mtime, rel = parts
+                    info = ""
+                elif len(parts) == 6:
+                    digest, arch, size, mtime, info, rel = parts
+                else:
+                    continue
                 try:
-                    cache[rel] = (digest, arch, int(size), int(mtime))
+                    cache[rel] = CacheEntry(digest, arch, int(size), int(mtime),
+                                            json.loads(info) if info and info_valid else None)
                 except ValueError:
                     continue
     except OSError:
@@ -284,29 +315,73 @@ def read_cache(path):
     return cache
 
 
-class HashIndex:
-    """digest -> path of a stored copy, shared by every build under one corpus root.
+def render_cache(entries):
+    lines = ["#\t%s\tinfo/%d" % (CACHE_SCHEMA, pelib.INFO_VERSION)]
+    for rel in sorted(entries):
+        e = entries[rel]
+        info = json.dumps(e.info, sort_keys=True, separators=(",", ":")) if e.info else ""
+        lines.append("\t".join((e.digest, e.arch, str(e.size), str(e.mtime), info, rel)))
+    return "\n".join(lines) + "\n"
 
-    A path the index points at always holds that digest as far as this tool knows: storing other
-    bytes at a path forgets whatever digest the index had placed there, so a later run never
-    links to a file whose content was replaced.
+
+def read_json(path):
+    try:
+        with open(lp(path), "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+class HashIndex:
+    """digest -> path of a stored copy, for hardlinking instead of copying.
+
+    Nothing is saved: the index is rebuilt at the start of every run from the manifests of the
+    completed builds under the link root (<out>/..), so it cannot go stale, survives moving the
+    root, and needs no file of its own. A manifest exists only for a completed run and lists the
+    tree that run left. Within the run, storing other bytes at a path forgets whatever digest the
+    index had placed there, so a file whose content was replaced is never linked to.
     """
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(self):
         self.by_digest = {}
         self.by_path = {}
-        if not path:
-            return
+
+    def add_build(self, rows, build):
+        """Index one build: ``rows`` is {rel: digest} from its manifest, ``build`` its corpus
+        directory. The first build to know a digest keeps it."""
+        for rel in sorted(rows):
+            if rel.startswith(("/", "\\")) or ":" in rel or ".." in rel.split("/"):
+                continue
+            digest = rows[rel]
+            if digest not in self.by_digest:
+                path = os.path.normpath(to_native(build, rel))
+                self.by_digest[digest] = path
+                self.by_path[self._key(path)] = digest
+
+    def add_root(self, root, out):
+        """Index every other completed build under ``root``: each manifests/<report>/ whose
+        manifest.sha256 exists, joined with the corpus directory its summary.json names (the
+        report's own name when it names none). Returns the number of builds added."""
+        manifests = os.path.join(root, "manifests")
         try:
-            with open(lp(path), "r", encoding="utf-8") as f:
-                for line in f:
-                    digest, sep, stored = line.rstrip("\n").partition("\t")
-                    if sep and len(digest) == 64 and stored:
-                        self.by_digest[digest] = stored
-                        self.by_path[self._key(stored)] = digest
+            names = sorted(os.listdir(lp(manifests)))
         except OSError:
-            pass
+            return 0
+        added = 0
+        for name in names:
+            report = os.path.join(manifests, name)
+            rows = read_manifest(os.path.join(report, "manifest.sha256"))
+            if not rows:
+                continue
+            corpus = (read_json(os.path.join(report, "summary.json")) or {}).get("corpus") or name
+            if not isinstance(corpus, str) or os.path.basename(corpus) != corpus or corpus in (".", ".."):
+                continue
+            build = os.path.join(root, corpus)
+            if self._key(build) == self._key(out) or not os.path.isdir(lp(build)):
+                continue
+            self.add_build(rows, build)
+            added += 1
+        return added
 
     @staticmethod
     def _key(path):
@@ -331,12 +406,6 @@ class HashIndex:
         self.by_path[key] = digest
         if prefer or digest not in self.by_digest:
             self.by_digest[digest] = os.path.normpath(stored)
-
-    def save(self):
-        if not self.path:
-            return
-        text = "".join("%s\t%s\n" % (d, self.by_digest[d]) for d in sorted(self.by_digest))
-        write_if_changed(self.path, text)
 
 
 def write_if_changed(path, text):
@@ -372,83 +441,108 @@ def render_manifest(rows):
 
 # ---- SCAN ----
 
-def scan(image, excludes, arch_filter, cache, rehash, log):
-    """Walk the source. Returns (records, files_seen, pruned, unusable, new_cache)."""
+def scan(image, excludes, arch_filter, cache, rehash, jobs, log):
+    """Walk the source; sniff and hash new files on ``jobs`` threads.
+
+    Returns (records, new_cache, counts, unusable). A file whose size and mtime match the scan
+    cache, or that is a hardlink of a file already seen in this run, is not read again.
+    """
     root = lp(image)
     records = []
-    files_seen = 0
-    pruned = 0
     unusable = []
     new_cache = {}
     by_inode = {}
-    pe_bytes = 0
-    live = not log.quiet and sys.stderr.isatty()
-    last = time.monotonic()
+    counts = {"files_seen": 0, "pruned": 0, "hashed": 0, "reused": 0,
+              "pe_bytes": 0, "hashed_bytes": 0}
+    progress = pelib.Progress(not log.quiet)
 
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-        rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
-        rel_dir = "" if rel_dir == "." else rel_dir
+    def render():
+        line = "scan: %d files, %d PE (%s)" % (counts["files_seen"], len(records),
+                                              byte_string(counts["pe_bytes"]))
+        if counts["reused"]:
+            line += ", %d reused" % counts["reused"]
+        if counts["hashed_bytes"]:
+            rate = counts["hashed_bytes"] / max(progress.elapsed(), 0.001)
+            line += ", hashing %s/s" % byte_string(rate)
+        return line
 
-        kept = []
-        for d in dirnames:
-            if is_excluded(("%s/%s" % (rel_dir, d)).lstrip("/").lower(), True, excludes):
-                pruned += 1
-            else:
-                kept.append(d)
-        dirnames[:] = kept
+    def candidates():
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
+            rel_dir = "" if rel_dir == "." else rel_dir
 
-        for name in filenames:
-            rel = ("%s/%s" % (rel_dir, name)).lstrip("/")
-            if is_excluded(rel.lower(), False, excludes):
-                pruned += 1
-                continue
-            files_seen += 1
-            path = os.path.join(dirpath, name)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if st.st_size < 0x40:
-                continue
+            kept = []
+            for d in dirnames:
+                if is_excluded(("%s/%s" % (rel_dir, d)).lstrip("/").lower(), True, excludes):
+                    counts["pruned"] += 1
+                else:
+                    kept.append(d)
+            dirnames[:] = kept
 
-            cached = None if rehash else cache.get(rel)
-            hit = by_inode.get((st.st_dev, st.st_ino)) if st.st_ino else None
-            if hit:
-                digest, arch = hit
-            elif cached and cached[2] == st.st_size and cached[3] == st.st_mtime_ns:
-                digest, arch = cached[0], cached[1]
-            else:
-                info = pelib.sniff_bytes(pelib.read_head(path), st.st_size)
-                if info is None:
+            for name in filenames:
+                rel = ("%s/%s" % (rel_dir, name)).lstrip("/")
+                if is_excluded(rel.lower(), False, excludes):
+                    counts["pruned"] += 1
                     continue
+                counts["files_seen"] += 1
+                path = os.path.join(dirpath, name)
                 try:
-                    digest = pelib.sha256_file(path)
+                    st = os.stat(path)
                 except OSError:
                     continue
-                arch = info["arch"]
-            if st.st_ino:
-                by_inode[(st.st_dev, st.st_ino)] = (digest, arch)
-            new_cache[rel] = "%s\t%s\t%d\t%d" % (digest, arch, st.st_size, st.st_mtime_ns)
+                if st.st_size < 0x40:
+                    continue
+                known = by_inode.get((st.st_dev, st.st_ino)) if st.st_ino else None
+                if known is None and not rehash:
+                    cached = cache.get(rel)
+                    if cached and (cached.size, cached.mtime) == (st.st_size, st.st_mtime_ns):
+                        known = cached
+                yield rel, path, st, known
 
-            if any(c in rel for c in "\t\r\n"):
-                unusable.append(rel)
-                continue
-            if arch_filter and arch not in arch_filter:
-                continue
-            records.append(make_record(rel, st.st_size, digest, arch))
-            pe_bytes += st.st_size
+    def examine(candidate):
+        """(CacheEntry, hashed) for a PE, None otherwise. Runs on a worker thread."""
+        rel, path, st, known = candidate
+        if known is not None:
+            return known, False
+        info = pelib.sniff_bytes(pelib.read_head(path), st.st_size)
+        if info is None:
+            return None
+        try:
+            digest = pelib.sha256_file(path)
+        except OSError:
+            return None
+        return CacheEntry(digest, info["arch"], st.st_size, st.st_mtime_ns, None), True
 
-            if live and time.monotonic() - last > PROGRESS_SECONDS:
-                last = time.monotonic()
-                sys.stderr.write("\r[i] scanned %d files, %d PE, %s   "
-                                 % (files_seen, len(records), byte_string(pe_bytes)))
-                sys.stderr.flush()
+    for (rel, path, st, _), result in pelib.ordered_map(examine, candidates(), jobs):
+        progress.tick(render)
+        if result is None:
+            continue
+        entry, hashed = result
+        if hashed:
+            counts["hashed"] += 1
+            counts["hashed_bytes"] += st.st_size
+        else:
+            counts["reused"] += 1
+        if st.st_ino:
+            by_inode[(st.st_dev, st.st_ino)] = entry
+        new_cache[rel] = entry._replace(size=st.st_size, mtime=st.st_mtime_ns)
 
-    if live:
-        sys.stderr.write("\r" + " " * 60 + "\r")
-        sys.stderr.flush()
-    log.info("scanned %d files, %d PE, %s" % (files_seen, len(records), byte_string(pe_bytes)))
-    return records, files_seen, pruned, unusable, new_cache
+        if any(c in rel for c in "\t\r\n"):
+            unusable.append(rel)
+            continue
+        if arch_filter and entry.arch not in arch_filter:
+            continue
+        rec = make_record(rel, st.st_size, entry.digest, entry.arch)
+        rec.info = dict(entry.info) if entry.info else None
+        records.append(rec)
+        counts["pe_bytes"] += st.st_size
+
+    progress.clear()
+    counts["seconds"] = progress.elapsed()
+    log.info("scanned %d files, %d PE, %s in %s (%d hashed, %d reused)" % (
+        counts["files_seen"], len(records), byte_string(counts["pe_bytes"]),
+        pelib.duration(counts["seconds"]), counts["hashed"], counts["reused"]))
+    return records, new_cache, counts, unusable
 
 
 # ---- SELECTION ----
@@ -478,18 +572,12 @@ def _canonical_order(rec):
     return (rec.rank, tuple(-x for x in version), rec.rel.lower(), rec.rel)
 
 
-def select_group(items, load_info):
-    """Choose what to store from one (name, arch) group.
-
-    Returns (stored, duplicate rows). Identical bytes are stored once, at the best-ranked path.
-    Every distinct content is stored; the best one is marked canonical. ``load_info(record)``
-    returns the pe_info of a record and is called once per stored record. The result depends
-    on the records and their bytes only, never on the order they were found in.
-    """
+def split_duplicates(items):
+    """Identical bytes of one (name, arch) group stored once, at the best-ranked path.
+    Returns (stored, duplicate rows). Needs no file access."""
     by_digest = {}
     for rec in items:
         by_digest.setdefault(rec.digest, []).append(rec)
-
     stored = []
     duplicates = []
     for digest in sorted(by_digest):
@@ -498,13 +586,30 @@ def select_group(items, load_info):
         stored.append(keep)
         for other in copies[1:]:
             duplicates.append((keep.name, keep.arch, digest, keep.rel, other.rel))
+    return stored, duplicates
 
-    for rec in stored:
-        if rec.info is None:
-            rec.info = load_info(rec) or {}
+
+def mark_canonical(stored):
+    """Sort one group's stored records best first and mark the first canonical. Every record
+    needs its info (the file version) loaded."""
     stored.sort(key=_canonical_order)
     for i, rec in enumerate(stored):
         rec.canonical = i == 0
+
+
+def select_group(items, load_info):
+    """Choose what to store from one (name, arch) group.
+
+    Returns (stored, duplicate rows). Identical bytes are stored once, at the best-ranked path.
+    Every distinct content is stored; the best one is marked canonical. ``load_info(record)``
+    returns the pe_info of a record and is called once per stored record without info. The
+    result depends on the records and their bytes only, never on the order they were found in.
+    """
+    stored, duplicates = split_duplicates(items)
+    for rec in stored:
+        if rec.info is None:
+            rec.info = load_info(rec) or {}
+    mark_canonical(stored)
     return stored, duplicates
 
 
@@ -604,6 +709,10 @@ def histogram(values):
     return dict(sorted(counts.items()))
 
 
+def phase_line(phases):
+    return ", ".join("%s %s" % (name, pelib.duration(seconds)) for name, seconds in phases.items())
+
+
 # ---- MAIN ----
 
 def parse_args(argv):
@@ -614,8 +723,9 @@ def parse_args(argv):
     ap.add_argument("out", help="corpus directory; stored files keep their image path inside it")
     ap.add_argument("--report", default="",
                     help="evidence directory (default: <out>/../manifests/<out-name>)")
-    ap.add_argument("--index", default="",
-                    help="shared hardlink index (default: <out>/../.hash-index.tsv; 'none' disables)")
+    ap.add_argument("--link-root", default="", metavar="DIR",
+                    help="corpus root whose other builds are hardlinked to (default: <out>/..; "
+                         "'none' links only within this build)")
     ap.add_argument("--label", default="", help="name recorded in summary.json (default: out name)")
     ap.add_argument("--resume", action="store_true",
                     help="reuse scan-cache.tsv and keep files already in place")
@@ -631,6 +741,9 @@ def parse_args(argv):
     ap.add_argument("--allow-collisions", action="store_true",
                     help="exit 0 even when collisions.tsv is not empty")
     ap.add_argument("--force", action="store_true", help="allow a non-empty output directory")
+    ap.add_argument("--jobs", type=int, default=pelib.default_jobs(), metavar="N",
+                    help="files read and hashed in parallel (default: CPU count, at most %d)"
+                    % pelib.MAX_DEFAULT_JOBS)
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="print only warnings, errors and the closing line")
     ap.add_argument("--version", action="version", version="os-corpus %s" % pelib.VERSION)
@@ -642,11 +755,15 @@ def default_report(out):
     return os.path.join(parent, "manifests", os.path.basename(os.path.abspath(out)))
 
 
-def default_index(out):
-    return os.path.join(os.path.dirname(os.path.abspath(out)), ".hash-index.tsv")
+def default_link_root(out):
+    return os.path.dirname(os.path.abspath(out))
 
 
 def main(argv=None):
+    # Line by line even into a pipe (extract-image.ps1, a log file), so progress is never held
+    # back in a buffer.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return run(args)
@@ -660,6 +777,8 @@ def run(args):
     image = os.path.abspath(args.image)
     out = os.path.abspath(args.out)
 
+    if args.jobs < 1:
+        return fail("--jobs must be at least 1", EXIT_USAGE)
     if not os.path.isdir(lp(image)):
         return fail("source is not a directory: %s" % image, EXIT_USAGE)
     if inside(out, image) or inside(image, out):
@@ -675,13 +794,11 @@ def run(args):
     if inside(report, out):
         return fail("report directory must be outside the corpus: %s" % report, EXIT_USAGE)
 
-    index_path = args.index
-    if index_path.lower() == "none":
-        index_path = ""
+    link_root = args.link_root
+    if link_root.lower() == "none":
+        link_root = ""
     else:
-        index_path = os.path.abspath(index_path) if index_path else default_index(out)
-    if index_path and inside(index_path, out):
-        return fail("index file must be outside the corpus: %s" % index_path, EXIT_USAGE)
+        link_root = os.path.abspath(link_root) if link_root else default_link_root(out)
 
     patterns = [p.replace("\\", "/").lower() for p in args.exclude]
     if not args.no_default_excludes:
@@ -689,20 +806,35 @@ def run(args):
     arch_filter = {a.strip().lower() for a in args.arch.split(",") if a.strip()}
 
     started = time.time()
+    phases = {}
     manifest_path = os.path.join(report, "manifest.sha256")
     cache = read_cache(os.path.join(report, "scan-cache.tsv")) if args.resume else {}
     previous = read_manifest(manifest_path) if args.resume else {}
-    index = HashIndex(index_path)
+    # This build's last completed run first, then every other build under the link root.
+    index = HashIndex()
+    index.add_build(read_manifest(manifest_path), out)
+    builds = index.add_root(link_root, out) if link_root else 0
 
     log.info("source   %s" % image)
     log.info("output   %s" % out)
     log.info("report   %s" % report)
-    log.info("index    %s" % (index_path or "none"))
+    if link_root:
+        log.info("link     %s (%d other build(s), %d contents indexed)" % (link_root, builds, len(index)))
+    else:
+        log.info("link     none: identical bytes are linked within this build only")
+    obsolete = os.path.join(link_root, OBSOLETE_INDEX) if link_root else ""
+    if obsolete and os.path.exists(lp(obsolete)):
+        log.skip("%s is no longer used (the link index is rebuilt from the manifests); it can "
+                 "be deleted" % obsolete)
+    log.info("jobs     %d" % args.jobs)
     if args.resume:
-        log.info("resume   %d cached PEs, %d manifest rows" % (len(cache), len(previous)))
+        log.info("resume   %d cached PEs (%d with module info), %d manifest rows" % (
+            len(cache), sum(1 for e in cache.values() if e.info), len(previous)))
 
-    records, files_seen, pruned, unusable, new_cache = scan(
-        image, patterns, arch_filter, cache, args.rehash or not args.resume, log)
+    log.step("scanning %s" % image)
+    records, new_cache, scanned, unusable = scan(
+        image, patterns, arch_filter, cache, args.rehash or not args.resume, args.jobs, log)
+    phases["scan"] = scanned["seconds"]
     for rel in unusable[:MAX_SHOWN]:
         log.skip("tab or line break in the path, not collected: %r" % rel)
     if not records:
@@ -713,16 +845,36 @@ def run(args):
     for rec in records:
         groups.setdefault(rec.key, []).append(rec)
 
-    stored = []
+    stored_groups = []
     duplicates = []
     for key in sorted(groups):
-        kept, dups = select_group(groups[key],
-                                  lambda r: pelib.pe_info(to_native(image, r.rel), r.size))
-        stored += kept
+        kept, dups = split_duplicates(groups[key])
+        stored_groups.append(kept)
         duplicates += dups
+    stored = [rec for kept in stored_groups for rec in kept]
+    need = [rec for rec in stored if rec.info is None]
+    log.step("selecting: %d PEs in %d (name, arch) groups, %d files to store; reading versions "
+             "of %d (%d cached)" % (len(records), len(groups), len(stored), len(need),
+                                    len(stored) - len(need)))
+    progress = pelib.Progress(not log.quiet)
+    done = 0
+    for rec, info in pelib.ordered_map(
+            lambda r: pelib.pe_info(to_native(image, r.rel), r.size), need, args.jobs):
+        rec.info = info or {}
+        done += 1
+        progress.tick(lambda: "select: %d/%d files read (%d%%)%s" % (
+            done, len(need), 100 * done // len(need), pelib.eta(progress.elapsed(), done, len(need))))
+    for kept in stored_groups:
+        mark_canonical(kept)
+    progress.clear()
+    phases["select"] = progress.elapsed()
+    log.info("selected %d files to store in %s" % (len(stored), pelib.duration(phases["select"])))
     stored.sort(key=lambda r: r.rel)
     duplicates.sort(key=lambda d: (d[0].lower(), d[1], d[3], d[4]))
     canonical = [r for r in stored if r.canonical]
+    for rec in stored:
+        if rec.rel in new_cache:
+            new_cache[rec.rel] = new_cache[rec.rel]._replace(info=cache_info(rec.info))
 
     copied_bytes = linked_bytes = skipped = 0
     stale = []
@@ -738,8 +890,16 @@ def run(args):
         if os.path.exists(lp(manifest_path)):
             os.unlink(lp(manifest_path))
             log.removed("manifest.sha256 (written again when this run completes)")
+        total_bytes = sum(r.size for r in stored)
+        done_bytes = 0
+        log.step("placing %d files (%s)" % (len(stored), byte_string(total_bytes)))
+        progress = pelib.Progress(not log.quiet)
         try:
-            for rec in stored:
+            for i, rec in enumerate(stored):
+                progress.tick(lambda: "place: %d/%d files (%d%%), %s of %s%s" % (
+                    i, len(stored), 100 * done_bytes // max(total_bytes, 1),
+                    byte_string(done_bytes), byte_string(total_bytes),
+                    pelib.eta(progress.elapsed(), done_bytes, total_bytes)))
                 action, size = place(to_native(image, rec.rel), to_native(out, rec.rel),
                                      rec.digest, rec.size, index, not args.no_link,
                                      previous.get(rec.rel))
@@ -749,11 +909,15 @@ def run(args):
                     linked_bytes += rec.size
                 else:
                     skipped += 1
+                done_bytes += rec.size
         finally:
-            index.save()
-        log.info("placed %d files: %s copied, %s linked, %d already in place"
-                 % (len(stored), byte_string(copied_bytes), byte_string(linked_bytes), skipped))
+            progress.clear()
+        log.step("checking the output for stale files")
         stale = find_stale(out, [r.rel for r in stored])
+        phases["place"] = progress.elapsed()
+        log.info("placed %d files: %s copied, %s linked, %d already in place, in %s"
+                 % (len(stored), byte_string(copied_bytes), byte_string(linked_bytes), skipped,
+                    pelib.duration(phases["place"])))
         if stale:
             log.skip("%d file(s) in the output are not in the manifest, first: %s; "
                      "verification fails until they are removed" % (len(stale), stale[0]))
@@ -762,20 +926,25 @@ def run(args):
     summary = {
         "schema": SUMMARY_SCHEMA,
         "tool": {"name": "os-corpus", "version": pelib.VERSION},
+        # The corpus directory's name, so a later build under the same root can find these files
+        # to link to even when the report directory is named otherwise (wrapper -Label).
+        "corpus": os.path.basename(os.path.normpath(out)),
         "source": {"name": os.path.basename(os.path.normpath(image)),
                    "kind": "directory",
                    "label": args.label or os.path.basename(os.path.normpath(out))},
         "counts": {
-            "files_seen": files_seen,
+            "files_seen": scanned["files_seen"],
             "pe_files": len(records) + len(collisions),
             "stored_files": len(stored),
             "distinct_modules": len(canonical),
             "variants": len(stored) - len(canonical),
             "duplicate_paths": len(duplicates),
             "collisions": len(collisions),
-            "pruned_paths": pruned,
+            "pruned_paths": scanned["pruned"],
             "skipped_existing": skipped,
             "stale_files": len(stale),
+            "hashed_files": scanned["hashed"],
+            "reused_files": scanned["reused"],
         },
         "bytes": {
             "stored_total": sum(r.size for r in stored),
@@ -788,7 +957,7 @@ def run(args):
         "reports": dict(REPORT_SCHEMAS),
         "excludes": patterns,
         "options": {"arch": sorted(arch_filter), "link": not args.no_link,
-                    "sharedIndex": bool(index_path)},
+                    "linkRoot": bool(link_root), "jobs": args.jobs},
         "dryRun": bool(args.dry_run),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
         "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished)),
@@ -796,24 +965,34 @@ def run(args):
     }
 
     if not args.dry_run:
+        clock = time.monotonic()
         module_rows = sorted((module_row(r) for r in stored),
                              key=lambda m: (m[0].lower(), m[1], -m[2], m[15].lower(), m[15]))
         outputs = [
             ("modules.tsv", render_tsv(MODULES_HEADER, module_rows)),
             ("duplicates.tsv", render_tsv(DUPLICATES_HEADER, duplicates)),
             ("collisions.tsv", render_tsv(COLLISIONS_HEADER, collisions)),
-            ("summary.json", json.dumps(summary, indent=2, sort_keys=True) + "\n"),
-            ("scan-cache.tsv", "".join("%s\t%s\n" % (new_cache[r], r) for r in sorted(new_cache))),
-            # Last: a manifest exists only for a run that completed.
-            ("manifest.sha256", render_manifest((r.digest, r.rel) for r in stored)),
+            ("scan-cache.tsv", render_cache(new_cache)),
         ]
+        log.step("writing reports to %s" % report)
         for name, text in outputs:
+            if write_if_changed(os.path.join(report, name), text):
+                log.done(name)
+            else:
+                log.same("%s unchanged" % name)
+        phases["reports"] = time.monotonic() - clock
+        # A list, not an object: summary.json sorts its keys, and the order is the run order.
+        summary["phases"] = [[name, round(seconds, 1)] for name, seconds in phases.items()]
+        # Last: a manifest exists only for a run that completed.
+        for name, text in (("summary.json", json.dumps(summary, indent=2, sort_keys=True) + "\n"),
+                           ("manifest.sha256", render_manifest((r.digest, r.rel) for r in stored))):
             if write_if_changed(os.path.join(report, name), text):
                 log.done(name)
             else:
                 log.same("%s unchanged" % name)
 
     print_counts(summary, log)
+    log.info("time              %s" % phase_line(phases))
     for row in collisions[:MAX_SHOWN]:
         fail("collision: %s and %s are one path" % (row[0], row[2]), EXIT_COLLISIONS)
     if len(collisions) > MAX_SHOWN:

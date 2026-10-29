@@ -36,10 +36,21 @@ import mmap
 import os
 import struct
 import sys
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 # ---- CONFIG ----
 
 VERSION = "0.1.0"
+
+# Version of what pe_info returns (sniffing, classification, version parsing). Bump it when a
+# change here alters a result, so collect_pes.py stops trusting info cached by an older run.
+INFO_VERSION = 1
+
+# Parallel hashing default: the CPU count, at most this. Measured on an NVMe SSD: 1 thread
+# 139 MB/s, 4 threads 539 MB/s, 8 threads 958 MB/s.
+MAX_DEFAULT_JOBS = 8
 
 PE32 = 0x10B
 PE32_PLUS = 0x20B
@@ -477,6 +488,112 @@ def pe_info(path, size=None):
     except OSError:
         info["size"] = 0
     return info
+
+
+# ---- PARALLEL ----
+
+def default_jobs():
+    return max(1, min(MAX_DEFAULT_JOBS, os.cpu_count() or 1))
+
+
+def ordered_map(func, items, jobs, window=None):
+    """Yield (item, func(item)) in input order, running up to ``jobs`` calls in threads.
+
+    hashlib and file reads release the GIL, so threads overlap I/O and hashing. At most
+    ``window`` calls are in flight (default 8 per job), so ``items`` can be a lazy walk. With
+    jobs 1 everything runs inline. ``func`` handles its own errors.
+    """
+    if jobs <= 1:
+        for item in items:
+            yield item, func(item)
+        return
+    window = window or jobs * 8
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        pending = deque()
+        for item in items:
+            pending.append((item, pool.submit(func, item)))
+            if len(pending) >= window:
+                done, future = pending.popleft()
+                yield done, future.result()
+        while pending:
+            done, future = pending.popleft()
+            yield done, future.result()
+
+
+# ---- PROGRESS ----
+
+def byte_string(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%d B" % n if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+    return "%d B" % n
+
+
+def duration(seconds):
+    """12.3s, 4m05s, 1h02m."""
+    if seconds < 60:
+        return "%.1fs" % seconds
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return "%dm%02ds" % (minutes, secs)
+    hours, minutes = divmod(minutes, 60)
+    return "%dh%02dm" % (hours, minutes)
+
+
+def eta(elapsed, done, total):
+    """', ETA 1m40s' from the share done so far, or '' before there is anything to go on."""
+    if done <= 0 or total <= done:
+        return ""
+    return ", ETA " + duration(elapsed * (total - done) / done)
+
+
+class Progress:
+    """Progress of one long phase, so a quiet stretch never looks like a hang.
+
+    On a console, one [i] line is redrawn in place every LIVE_SECONDS. Anywhere else (a pipe,
+    a log file, extract-image.ps1) a plain [i] line is printed every LOG_SECONDS. ``tick``
+    takes a function, so the line is only formatted when it is printed.
+    """
+
+    LIVE_SECONDS = 0.5
+    LOG_SECONDS = 10.0
+
+    def __init__(self, enabled=True, stream=None):
+        self.stream = stream or sys.stdout
+        self.enabled = enabled
+        try:
+            self.live = enabled and self.stream.isatty()
+        except (AttributeError, ValueError):
+            self.live = False
+        self.started = time.monotonic()
+        self.last = self.started
+        self.width = 0
+
+    def elapsed(self):
+        return time.monotonic() - self.started
+
+    def tick(self, render):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now - self.last < (self.LIVE_SECONDS if self.live else self.LOG_SECONDS):
+            return
+        self.last = now
+        line = "[i] %s, %s" % (render(), duration(now - self.started))
+        if self.live:
+            self.stream.write("\r" + line.ljust(self.width))
+            self.width = len(line)
+        else:
+            self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def clear(self):
+        """Remove the live line, before the next regular line is printed."""
+        if self.live and self.width:
+            self.stream.write("\r" + " " * self.width + "\r")
+            self.stream.flush()
+            self.width = 0
 
 
 # ---- COMMAND LINE ----

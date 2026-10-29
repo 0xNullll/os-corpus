@@ -18,6 +18,7 @@ sys.path.insert(0, str(BIN))
 COLLECT = str(BIN / "collect_pes.py")
 VERIFY = str(BIN / "verify_corpus.py")
 PELIB = str(BIN / "pelib.py")
+DIFF = str(BIN / "diff_corpus.py")
 WRAPPER = str(BIN / "extract-image.ps1")
 
 PE32, PE32_PLUS = 0x10B, 0x20B

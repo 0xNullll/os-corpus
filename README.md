@@ -24,8 +24,9 @@ media (ISO / WIM / ESD / VHD)  or  a directory
       modules.tsv                           one classified row per stored file
       duplicates.tsv                        paths not stored: same name, arch and bytes
       collisions.tsv                        paths found twice (case-sensitive sources)
-      summary.json                          counts, bytes, histograms
+      summary.json                          counts, bytes, histograms, phase times
       source.json                           the media: hash, edition, build (wrapper)
+  corpus/logs/<build>-<time>.log            everything the run printed (wrapper)
 ```
 
 ## Scripts
@@ -35,12 +36,11 @@ media (ISO / WIM / ESD / VHD)  or  a directory
 | `bin/extract-image.ps1` | orchestrator | hashes and mounts the media read-only, runs collect and verify, records `source.json`, always dismounts | ISO, WIM, ESD, VHD |
 | `bin/collect_pes.py` | engine | directory in, corpus and reports out | never |
 | `bin/verify_corpus.py` | check | re-hashes the corpus and cross-checks every report | never |
+| `bin/diff_corpus.py` | report | what changed between two builds: added, removed, updated, rebuilt, moved | never |
 | `bin/pelib.py` | library + CLI | PE sniffing, classification, versions, long paths; `pelib.py info <file>` | never |
 
 **[USAGE.md](USAGE.md)** is the full specification of each script: options,
 selection rules, checks, every output column, exit codes and known gaps.
-**[PLAN.md](PLAN.md)** holds the design: invariants, architecture and
-milestones.
 
 ## Requirements
 
@@ -53,15 +53,23 @@ milestones.
 
 ```powershell
 # 1. list the editions on the media (exits with code 2)
-.\bin\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045
+.\bin\extract-image.ps1 -Iso D:\media\Win11.iso -Out D:\corpus\10.0.26300
 
-# 2. collect one (Desktop Experience on server media); verification runs automatically
-.\bin\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045 -Index 6
+# 2. collect one edition by name, the same on every ISO; verification runs automatically
+.\bin\extract-image.ps1 -Iso D:\media\Win11.iso -Out D:\corpus\10.0.26300 -Edition "Windows 11 Pro"
 
 # 3. one file per module and architecture, for consumers that need exactly one
-Import-Csv -Delimiter "`t" D:\corpus\manifests\10.0.19045\modules.tsv |
+Import-Csv -Delimiter "`t" D:\corpus\manifests\10.0.26300\modules.tsv |
     Where-Object canonical -eq 1
+
+# 4. what changed since an earlier build
+python .\bin\diff_corpus.py D:\corpus\10.0.19045 D:\corpus\10.0.26300 --tsv changes.tsv
 ```
+
+Every phase prints progress and its duration, a run ends with the time of
+each phase and its result, and the whole output is kept in
+`corpus\logs\`. An interrupted run continues with `-Resume`, which reuses
+what the earlier run hashed and read.
 
 An already-mounted or extracted tree needs no wrapper and no elevation:
 
@@ -90,9 +98,12 @@ python .\bin\verify_corpus.py D:\corpus\sample
 - **Both architectures from one x64 image.** `System32` is x64 and
   `SysWOW64` is x86.
 
-Identical binaries are hardlinked across builds through a shared index, so
-a second build costs only the bytes that changed. Re-runs are resumable,
-and reports are rewritten byte for byte.
+Identical binaries are hardlinked across builds kept under one corpus root,
+so a second build costs only the bytes that changed. The links are found
+from the other builds' manifests at the start of each run; there is no
+index file to keep in sync, and the root can be moved. Files are hashed in
+parallel (`--jobs`, default the CPU count, at most 8). Re-runs are
+resumable, and reports are rewritten byte for byte.
 
 ## Exit codes
 
@@ -123,11 +134,12 @@ the latest run on `main`. Real installation media is never mounted in CI.
 
 | Module | Covers |
 |---|---|
-| `tests/test_pelib.py` | sniffing and malformed headers, classification, versions, long paths, the CLI |
-| `tests/test_collect.py` | locations, selection and collisions as pure functions; collection end to end, re-runs, hardlink safety, deep paths |
-| `tests/test_verify.py` | every failure class against a tampered corpus, the report columns shared with collect |
-| `tests/test_extract_image.py` | the wrapper's directory path and its argument checks |
+| `tests/test_pelib.py` | sniffing and malformed headers, classification, versions, long paths, progress, parallel map, the CLI |
+| `tests/test_collect.py` | locations, selection and collisions as pure functions; collection end to end, re-runs, the scan cache, `--jobs`, hardlink safety, deep paths |
+| `tests/test_verify.py` | every failure class against a tampered corpus, parallel re-hashing, the report columns shared with collect |
+| `tests/test_diff.py` | every kind of change between two collected corpora, the TSV |
+| `tests/test_extract_image.py` | the wrapper's directory path, its run log and closing lines, relative paths, its argument checks |
 
 ## License
 
-MIT. See `LICENSE`.
+This project is released under the **MIT license**. See [LICENSE](LICENSE) for full text.

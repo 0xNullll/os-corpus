@@ -7,13 +7,16 @@
     Hashes the source, mounts it read-only (ISO, WIM, ESD, VHD) or takes a directory as it is,
     runs collect_pes.py against the mount, records the media in source.json, then runs
     verify_corpus.py. Every mount, and the temporary WIM of an ESD, is removed in a finally
-    block, also after an error or Ctrl+C.
+    block, also after an error or Ctrl+C. The closing lines (summary, phase times, result) come
+    after that cleanup, so the last line of a run is its result.
+
+    Everything printed is also written to <Out>\..\logs\<Label>-<UTC time>.log (-NoLog: off).
 
     Nothing is written inside the source. Nothing is deleted unless -DeleteSource is passed and
     verification passed.
 
-    Log lines follow the os-corpus conventions (USAGE.md): [i] information, [>] a step being
-    run, [+] done, [~] skipped or a warning, [!] an error (stderr).
+    Log lines follow the os-corpus conventions (USAGE.md): [i] information, [>] a phase
+    starting, [+] done, [-] removed, [~] skipped or a warning, [!] an error (stderr).
 
     Exit codes: 0 success, 1 error, 2 bad usage or an edition listing, 3 collisions, 4 or 5
     verification failed (see verify_corpus.py), 130 collection interrupted.
@@ -32,20 +35,29 @@
     An already-mounted or extracted tree. Needs no elevation.
 
 .PARAMETER Out
-    Corpus directory. Stored files keep their image path inside it.
+    Corpus directory. Stored files keep their image path inside it. A relative path is taken
+    from the current PowerShell location.
 
 .PARAMETER Report
     Report directory. Default: <Out>\..\manifests\<Label>.
 
+.PARAMETER Edition
+    Image to collect, by its exact name as listed, e.g. "Windows 11 Pro". The same name picks
+    the same edition on every ISO, whatever its index. Cannot be combined with -Index.
+
 .PARAMETER Index
-    WIM/ESD image index. 0 (the default) lists the editions and exits with code 2.
+    WIM/ESD image index. 0 (the default) with no -Edition lists the editions and exits with 2.
 
 .PARAMETER Label
-    Name of the build, used for the report directory and summary.json. Default: the name of
-    Out. Characters other than letters, digits, '.', '_' and '-' become '_'.
+    Name of the build, used for the report directory, the log file and summary.json. Default:
+    the name of Out. Characters other than letters, digits, '.', '_' and '-' become '_'.
 
 .PARAMETER Arch
     Architecture filter passed to collect_pes.py, e.g. "x64,x86".
+
+.PARAMETER Jobs
+    Files hashed in parallel by collect_pes.py and verify_corpus.py. Default: their own
+    default (the CPU count, at most 8).
 
 .PARAMETER Python
     Python interpreter to run the tools with. Default: python.
@@ -59,6 +71,9 @@
 .PARAMETER NoVerify
     Skip the verification pass. Cannot be combined with -DeleteSource.
 
+.PARAMETER NoLog
+    Do not write the log file.
+
 .PARAMETER ConvertEsd
     Export the chosen image of an install.esd to a temporary WIM (<Out>\..\.tmp) before
     mounting. Needs room for the image; the temporary WIM is deleted afterwards.
@@ -67,12 +82,12 @@
     Delete the ISO after verification passed. Only valid with -Iso, never with -NoVerify.
 
 .EXAMPLE
-    .\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045
+    .\extract-image.ps1 -Iso D:\media\Win11.iso -Out D:\corpus\10.0.26300
     Lists the editions on the media and exits with code 2.
 
 .EXAMPLE
-    .\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045 -Index 6 -Label 10.0.19045
-    Collects edition 6 and verifies it.
+    .\extract-image.ps1 -Iso D:\media\Win11.iso -Out D:\corpus\10.0.26300 -Edition "Windows 11 Pro"
+    Collects Windows 11 Pro and verifies it.
 
 .EXAMPLE
     .\extract-image.ps1 -Wim D:\media\install.esd -ConvertEsd -Index 4 -Out D:\corpus\26200
@@ -98,13 +113,16 @@ param(
     [string] $Out,
 
     [string] $Report,
+    [string] $Edition,
     [int] $Index = 0,
     [string] $Label,
     [string] $Arch,
+    [int] $Jobs = 0,
     [string] $Python = 'python',
     [switch] $Resume,
     [switch] $Force,
     [switch] $NoVerify,
+    [switch] $NoLog,
     [switch] $ConvertEsd,
     [switch] $DeleteSource
 )
@@ -121,8 +139,13 @@ $ExitInterrupted = 130
 
 $SourceSchema = 'os-corpus/source/1'
 
+# Seconds between progress lines while the container is hashed.
+$ProgressSeconds = 5
+
 # Get-WindowsImage Architecture values.
 $ImageArch = @{ 0 = 'x86'; 5 = 'arm'; 6 = 'ia64'; 9 = 'x64'; 12 = 'arm64' }
+
+$Utf8NoBom = New-Object Text.UTF8Encoding($false)
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Collect = Join-Path $ScriptDir 'collect_pes.py'
@@ -130,17 +153,63 @@ $Verify = Join-Path $ScriptDir 'verify_corpus.py'
 $Pelib = Join-Path $ScriptDir 'pelib.py'
 
 # ---- OUTPUT ----
+# Every line goes through Write-Line, so the console and the log file always hold the same text.
 
-function Write-Info([string] $Text) { Write-Host "[i] $Text" }
-function Write-Run([string] $Text) { Write-Host "[>] $Text" }
-function Write-Done([string] $Text) { Write-Host "[+] $Text" }
-function Write-Skip([string] $Text) { Write-Host "[~] $Text" }
-function Write-Fail([string] $Text) {
-    [Console]::Out.Flush()
-    [Console]::Error.WriteLine("[!] extract-image: $Text")
+$script:LogPath = ''
+
+function Write-Line([string] $Text, [switch] $ToError) {
+    if ($ToError) {
+        [Console]::Out.Flush()
+        [Console]::Error.WriteLine($Text)
+    } else {
+        Write-Host $Text
+    }
+    if ($script:LogPath) {
+        try { [IO.File]::AppendAllText($script:LogPath, $Text + "`n", $Utf8NoBom) } catch { }
+    }
+}
+
+function Write-Info([string] $Text) { Write-Line "[i] $Text" }
+function Write-Run([string] $Text) { Write-Line "[>] $Text" }
+function Write-Done([string] $Text) { Write-Line "[+] $Text" }
+function Write-Removed([string] $Text) { Write-Line "[-] $Text" }
+function Write-Skip([string] $Text) { Write-Line "[~] $Text" }
+function Write-Fail([string] $Text) { Write-Line "[!] extract-image: $Text" -ToError }
+
+# Runs a native program and passes each line of its stdout and stderr through Write-Line, as it
+# arrives. Returns the exit code. Its stderr is merged with 2>&1, which Windows PowerShell turns
+# into error records; with 'Stop' in effect the first one would end the script, hence 'Continue'
+# here.
+function Invoke-Native([string] $Exe, [string[]] $Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) {
+                Write-Line ([string] $_.Exception.Message) -ToError
+            } else {
+                Write-Line ([string] $_)
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return $LASTEXITCODE
+}
+
+# A Python tool, unbuffered so its progress lines arrive as they are printed.
+function Invoke-Tool([string[]] $Arguments) {
+    return Invoke-Native $Python (@('-u') + $Arguments)
 }
 
 # ---- HELPERS ----
+
+# A full path, with a relative one taken from the PowerShell location ($PWD). Not
+# [IO.Path]::GetFullPath: it uses the process directory, which `cd` does not change, so in an
+# elevated window it stays C:\Windows\system32.
+function Resolve-FullPath([string] $Path) {
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
 
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -149,11 +218,11 @@ function Test-IsAdmin {
 }
 
 function Show-Images([string] $Path) {
-    Get-WindowsImage -ImagePath $Path |
+    $table = Get-WindowsImage -ImagePath $Path |
         Select-Object ImageIndex, ImageName, ImageDescription |
         Format-Table -AutoSize |
-        Out-String -Width 220 |
-        Write-Host
+        Out-String -Width 220
+    foreach ($line in ($table.TrimEnd() -split "`r?`n")) { Write-Line $line }
 }
 
 function Get-ToolVersion {
@@ -174,14 +243,40 @@ function Get-PeRevision([string] $DllPath) {
     return [string] (Get-Item -LiteralPath $DllPath).VersionInfo.FileVersion
 }
 
+# 12.3s, 4m05s, 1h02m, like pelib.duration.
+function Format-Duration([double] $Seconds) {
+    if ($Seconds -lt 60) { return '{0:N1}s' -f $Seconds }
+    $span = [TimeSpan]::FromSeconds([Math]::Floor($Seconds))
+    if ($span.TotalHours -lt 1) { return '{0}m{1:D2}s' -f [int][Math]::Floor($span.TotalMinutes), $span.Seconds }
+    return '{0}h{1:D2}m' -f [int][Math]::Floor($span.TotalHours), $span.Minutes
+}
+
 # .NET instead of Get-FileHash. In Windows PowerShell 5.1, Get-FileHash is a script function of
 # the Utility module, and it is missing when powershell.exe inherits PowerShell 7's PSModulePath
 # (started from a pwsh session, such as the default shell of GitHub Actions).
-function Get-FileSha256([string] $Path) {
+# With -ShowProgress, prints the share hashed every $ProgressSeconds.
+function Get-FileSha256([string] $Path, [switch] $ShowProgress) {
     $sha = [Security.Cryptography.SHA256]::Create()
     $stream = [IO.File]::OpenRead($Path)
     try {
-        return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+        $buffer = New-Object byte[] (4MB)
+        $total = [Math]::Max($stream.Length, 1)
+        $done = 0L
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $next = $ProgressSeconds
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            [void] $sha.TransformBlock($buffer, 0, $read, $null, 0)
+            $done += $read
+            $seconds = $clock.Elapsed.TotalSeconds
+            if ($ShowProgress -and $seconds -ge $next) {
+                $next = $seconds + $ProgressSeconds
+                $left = $seconds * ($total - $done) / $done
+                Write-Info ('hash: {0}% ({1:N1} of {2:N1} GB), {3}, ETA {4}' -f [int](100 * $done / $total),
+                    ($done / 1GB), ($total / 1GB), (Format-Duration $seconds), (Format-Duration $left))
+            }
+        }
+        [void] $sha.TransformFinalBlock($buffer, 0, 0)
+        return ([BitConverter]::ToString($sha.Hash) -replace '-', '').ToLowerInvariant()
     } finally {
         $stream.Dispose()
         $sha.Dispose()
@@ -213,8 +308,13 @@ function Get-ContainerRecord($Info, [string] $Name, [int] $ImageIndex) {
 
 # UTF-8 without a BOM and LF line ends, like every other report.
 function Write-TextFile([string] $Path, [string] $Text) {
-    $encoding = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($Path, (($Text -replace "`r`n", "`n").TrimEnd("`n") + "`n"), $encoding)
+    [IO.File]::WriteAllText($Path, (($Text -replace "`r`n", "`n").TrimEnd("`n") + "`n"), $Utf8NoBom)
+}
+
+# Phase durations for the closing time line, in the order they ran.
+$Phases = [ordered]@{}
+function Add-Phase([string] $Name, [double] $Seconds) {
+    if ($Phases.Contains($Name)) { $Phases[$Name] += $Seconds } else { $Phases[$Name] = $Seconds }
 }
 
 # ---- VALIDATION ----
@@ -227,8 +327,20 @@ if ($DeleteSource -and $PSCmdlet.ParameterSetName -ne 'Iso') {
     Write-Fail '-DeleteSource only applies to -Iso'
     exit $ExitUsage
 }
+if ($Edition -and $Index) {
+    Write-Fail '-Edition and -Index both pick the image; pass one of them'
+    exit $ExitUsage
+}
+if ($Edition -and $PSCmdlet.ParameterSetName -eq 'Directory') {
+    Write-Fail '-Edition needs an image source (-Iso, -Wim or -Vhd)'
+    exit $ExitUsage
+}
 if ($Index -lt 0) {
     Write-Fail '-Index must be 0 (list the editions) or an image index'
+    exit $ExitUsage
+}
+if ($Jobs -lt 0) {
+    Write-Fail '-Jobs must be at least 1 (0 keeps the tools'' default)'
     exit $ExitUsage
 }
 foreach ($file in @($Collect, $Verify, $Pelib)) {
@@ -248,27 +360,34 @@ if ($PSCmdlet.ParameterSetName -ne 'Directory' -and -not (Test-IsAdmin)) {
     exit $ExitError
 }
 
-$fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
-$longPaths = (Get-ItemProperty -LiteralPath $fsKey -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
-if ($longPaths -ne 1) {
-    Write-Skip 'LongPathsEnabled is not set; the tools use \\?\ paths, other programs may not'
-}
-
-$Out = [IO.Path]::GetFullPath($Out)
+$Out = (Resolve-FullPath $Out)
 $Parent = Split-Path -Parent $Out
 if (-not $Label) { $Label = Split-Path -Leaf $Out }
 $Label = $Label -replace '[^A-Za-z0-9._-]', '_'
 if (-not $Report) {
     $Report = Join-Path (Join-Path $Parent 'manifests') $Label
 }
-$Report = [IO.Path]::GetFullPath($Report)
+$Report = (Resolve-FullPath $Report)
 if ($Report.StartsWith($Out + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     Write-Fail "report directory must be outside the corpus: $Report"
     exit $ExitUsage
 }
 
+if (-not $NoLog) {
+    $logDir = Join-Path $Parent 'logs'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $script:LogPath = Join-Path $logDir ('{0}-{1}.log' -f $Label, $stamp)
+}
+
+$fsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+$longPaths = (Get-ItemProperty -LiteralPath $fsKey -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
+if ($longPaths -ne 1) {
+    Write-Skip 'LongPathsEnabled is not set; the tools use \\?\ paths, other programs may not'
+}
+
 # ---- STATE ----
-# Everything the finally block may have to undo.
+# Everything the finally block may have to undo, and what the closing lines report.
 
 $Kind = ''
 $ImageName = ''
@@ -288,16 +407,19 @@ $ConvertedWim = ''
 $Listed = $false
 $CollectCode = 0
 $VerifyCode = 0
+$Result = $null
 $script:FinalCode = $ExitOk
+$RunClock = [Diagnostics.Stopwatch]::StartNew()
 
 try {
     $ToolVersion = Get-ToolVersion
-    Write-Info "os-corpus $ToolVersion, build $Label"
+    Write-Info "os-corpus $ToolVersion, label $Label"
+    if ($script:LogPath) { Write-Info "log         $script:LogPath" }
 
     switch ($PSCmdlet.ParameterSetName) {
         'Directory' {
             $Kind = 'directory'
-            $ScanRoot = [IO.Path]::GetFullPath($Directory)
+            $ScanRoot = (Resolve-FullPath $Directory)
             if (-not (Test-Path -LiteralPath $ScanRoot -PathType Container)) {
                 throw "not a directory: $ScanRoot"
             }
@@ -306,55 +428,27 @@ try {
 
         'Iso' {
             $Kind = 'iso'
-            $IsoPath = [IO.Path]::GetFullPath($Iso)
+            $IsoPath = (Resolve-FullPath $Iso)
             if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
                 throw "no such ISO: $IsoPath"
             }
             $ImageName = Split-Path -Leaf $IsoPath
             $ImageBytes = (Get-Item -LiteralPath $IsoPath).Length
-            Write-Run "hashing $ImageName"
-            $ImageSha = Get-FileSha256 $IsoPath
-
-            $disk = Get-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue
-            if ($disk -and $disk.Attached) {
-                Write-Info 'ISO is already mounted; it is left mounted afterwards'
-            } else {
-                Write-Run 'mounting ISO read-only'
-                $disk = Mount-DiskImage -ImagePath $IsoPath -Access ReadOnly -PassThru
-                $DiskPath = $IsoPath
-            }
-            $volume = $disk | Get-Volume | Select-Object -First 1
-            if (-not $volume -or -not $volume.DriveLetter) {
-                throw 'mounted ISO has no drive letter'
-            }
-            $sources = "$($volume.DriveLetter):\sources"
-            if (-not (Test-Path -LiteralPath $sources)) {
-                throw 'no \sources directory on the media; is this a Windows ISO?'
-            }
-            foreach ($candidate in @('install.wim', 'install.esd')) {
-                $path = Join-Path $sources $candidate
-                if (Test-Path -LiteralPath $path) { $ImagePath = $path; break }
-            }
-            if (-not $ImagePath) {
-                throw "no install.wim or install.esd in $sources"
-            }
         }
 
         'Wim' {
             $Kind = 'wim'
-            $ImagePath = [IO.Path]::GetFullPath($Wim)
+            $ImagePath = (Resolve-FullPath $Wim)
             if (-not (Test-Path -LiteralPath $ImagePath -PathType Leaf)) {
                 throw "no such image: $ImagePath"
             }
             $ImageName = Split-Path -Leaf $ImagePath
             $ImageBytes = (Get-Item -LiteralPath $ImagePath).Length
-            Write-Run "hashing $ImageName"
-            $ImageSha = Get-FileSha256 $ImagePath
         }
 
         'Vhd' {
             $Kind = 'vhd'
-            $VhdPath = [IO.Path]::GetFullPath($Vhd)
+            $VhdPath = (Resolve-FullPath $Vhd)
             if (-not (Test-Path -LiteralPath $VhdPath -PathType Leaf)) {
                 throw "no such VHD: $VhdPath"
             }
@@ -363,28 +457,75 @@ try {
             }
             $ImageName = Split-Path -Leaf $VhdPath
             $ImageBytes = (Get-Item -LiteralPath $VhdPath).Length
-            Write-Run "hashing $ImageName"
-            $ImageSha = Get-FileSha256 $VhdPath
+        }
+    }
 
-            Write-Run 'mounting VHD read-only'
-            $disk = Mount-VHD -Path $VhdPath -ReadOnly -PassThru
-            $VhdMounted = $true
-            $volumes = Get-Disk -Number $disk.Number | Get-Partition | Get-Volume |
-                Where-Object { $_.DriveLetter }
-            foreach ($candidate in $volumes) {
-                $root = "$($candidate.DriveLetter):\"
-                if (Test-Path -LiteralPath (Join-Path $root 'Windows\System32\ntdll.dll')) {
-                    $ScanRoot = $root
-                    break
-                }
-                if (Test-Path -LiteralPath (Join-Path $root 'sources\install.wim')) {
-                    $ImagePath = Join-Path $root 'sources\install.wim'
-                    break
-                }
+    if ($Kind -ne 'directory') {
+        $hashed = if ($IsoPath) { $IsoPath } elseif ($VhdPath) { $VhdPath } else { $ImagePath }
+        Write-Run ('hashing {0} ({1:N1} GB)' -f $ImageName, ($ImageBytes / 1GB))
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $ImageSha = Get-FileSha256 $hashed -ShowProgress
+        Add-Phase 'hash' $clock.Elapsed.TotalSeconds
+        Write-Done ('hashed in {0}: sha256 {1}' -f (Format-Duration $clock.Elapsed.TotalSeconds), $ImageSha)
+    }
+
+    if ($Kind -eq 'iso') {
+        $disk = Get-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue
+        if ($disk -and $disk.Attached) {
+            Write-Info 'ISO is already mounted; it is left mounted afterwards'
+        } else {
+            Write-Run 'mounting ISO read-only'
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $disk = Mount-DiskImage -ImagePath $IsoPath -Access ReadOnly -PassThru
+            $DiskPath = $IsoPath
+            Add-Phase 'mount' $clock.Elapsed.TotalSeconds
+        }
+        $volume = $disk | Get-Volume | Select-Object -First 1
+        if (-not $volume -or -not $volume.DriveLetter) {
+            throw 'mounted ISO has no drive letter'
+        }
+        if ($DiskPath) {
+            Write-Done ('ISO mounted as {0}: ({1}) in {2}' -f $volume.DriveLetter, $volume.FileSystemLabel,
+                (Format-Duration $Phases['mount']))
+        }
+        $sources = "$($volume.DriveLetter):\sources"
+        if (-not (Test-Path -LiteralPath $sources)) {
+            throw 'no \sources directory on the media; is this a Windows ISO?'
+        }
+        foreach ($candidate in @('install.wim', 'install.esd')) {
+            $path = Join-Path $sources $candidate
+            if (Test-Path -LiteralPath $path) { $ImagePath = $path; break }
+        }
+        if (-not $ImagePath) {
+            throw "no install.wim or install.esd in $sources"
+        }
+    }
+
+    if ($Kind -eq 'vhd') {
+        Write-Run 'mounting VHD read-only'
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $disk = Mount-VHD -Path $VhdPath -ReadOnly -PassThru
+        $VhdMounted = $true
+        Add-Phase 'mount' $clock.Elapsed.TotalSeconds
+        Write-Done ('VHD mounted in {0}' -f (Format-Duration $clock.Elapsed.TotalSeconds))
+        $volumes = Get-Disk -Number $disk.Number | Get-Partition | Get-Volume |
+            Where-Object { $_.DriveLetter }
+        foreach ($candidate in $volumes) {
+            $root = "$($candidate.DriveLetter):\"
+            if (Test-Path -LiteralPath (Join-Path $root 'Windows\System32\ntdll.dll')) {
+                $ScanRoot = $root
+                break
             }
-            if (-not $ScanRoot -and -not $ImagePath) {
-                throw 'no Windows volume and no install.wim inside the VHD'
+            if (Test-Path -LiteralPath (Join-Path $root 'sources\install.wim')) {
+                $ImagePath = Join-Path $root 'sources\install.wim'
+                break
             }
+        }
+        if (-not $ScanRoot -and -not $ImagePath) {
+            throw 'no Windows volume and no install.wim inside the VHD'
+        }
+        if ($ScanRoot -and $Edition) {
+            Write-Skip "-Edition ignored: the VHD holds an installed Windows volume, not an image"
         }
     }
 
@@ -395,10 +536,21 @@ try {
             throw 'ESD images cannot be mounted; pass -ConvertEsd to export the image to a temporary WIM first'
         }
 
+        if ($Edition) {
+            $found = @(Get-WindowsImage -ImagePath $ImagePath | Where-Object { $_.ImageName -ieq $Edition })
+            if ($found.Count -ne 1) {
+                Show-Images $ImagePath
+                if ($found.Count -eq 0) { throw "no edition named '$Edition' in $containerName" }
+                throw "$($found.Count) editions named '$Edition' in $containerName; pass -Index"
+            }
+            $Index = [int] $found[0].ImageIndex
+            Write-Info "edition '$Edition' is image $Index"
+        }
+
         if ($Index -eq 0) {
             Write-Info "editions in $containerName"
             Show-Images $ImagePath
-            Write-Info 'nothing collected; re-run with -Index <n> (on server media, the Desktop Experience edition)'
+            Write-Info "nothing collected; re-run with -Edition '<name>' or -Index <n> (on server media, a Desktop Experience edition)"
             $Listed = $true
             $script:FinalCode = $ExitUsage
         } else {
@@ -418,13 +570,15 @@ try {
                 if (Test-Path -LiteralPath $ConvertedWim) {
                     throw "temporary WIM already exists: $ConvertedWim (left by an earlier run; remove it)"
                 }
-                Write-Run "exporting image $Index to $ConvertedWim (slow)"
-                $sourceArg = '/SourceImageFile:{0}' -f $ImagePath
-                $destArg = '/DestinationImageFile:{0}' -f $ConvertedWim
-                & dism.exe /English /Export-Image $sourceArg "/SourceIndex:$Index" $destArg /Compress:max | Out-Host
-                if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $ConvertedWim)) {
-                    throw "dism export failed with exit code $LASTEXITCODE"
+                Write-Run "exporting image $Index to $ConvertedWim"
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                $code = Invoke-Native 'dism.exe' @('/English', '/Export-Image', "/SourceImageFile:$ImagePath",
+                    "/SourceIndex:$Index", "/DestinationImageFile:$ConvertedWim", '/Compress:max')
+                if ($code -ne 0 -or -not (Test-Path -LiteralPath $ConvertedWim)) {
+                    throw "dism export failed with exit code $code"
                 }
+                Add-Phase 'export' $clock.Elapsed.TotalSeconds
+                Write-Done ('exported in {0}' -f (Format-Duration $clock.Elapsed.TotalSeconds))
                 # The exported WIM holds this one image, at index 1.
                 $ImagePath = $ConvertedWim
                 $MountIndex = 1
@@ -439,8 +593,11 @@ try {
                 New-Item -ItemType Directory -Force -Path $MountDir | Out-Null
             }
             Write-Run "mounting image $Index read-only"
+            $clock = [Diagnostics.Stopwatch]::StartNew()
             Mount-WindowsImage -ImagePath $ImagePath -Index $MountIndex -Path $MountDir -ReadOnly | Out-Null
             $WimMounted = $true
+            Add-Phase 'mount' $clock.Elapsed.TotalSeconds
+            Write-Done ('image mounted in {0}' -f (Format-Duration $clock.Elapsed.TotalSeconds))
             $ScanRoot = $MountDir
         }
     }
@@ -452,18 +609,33 @@ try {
 
         $collectArgs = @($Collect, $ScanRoot, $Out, '--report', $Report, '--label', $Label)
         if ($Arch) { $collectArgs += @('--arch', $Arch) }
+        if ($Jobs) { $collectArgs += @('--jobs', [string] $Jobs) }
         if ($Resume) { $collectArgs += '--resume' }
         if ($Force) { $collectArgs += '--force' }
 
         Write-Run "collecting from $ScanRoot"
-        & $Python @collectArgs | Out-Host
-        $CollectCode = $LASTEXITCODE
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $CollectCode = Invoke-Tool $collectArgs
+        $collectSeconds = $clock.Elapsed.TotalSeconds
         if ($CollectCode -eq $ExitInterrupted) {
             $script:FinalCode = $ExitInterrupted
             throw 'collection was interrupted; re-run with -Resume'
         }
         if ($CollectCode -ne $ExitOk -and $CollectCode -ne $ExitCollisions) {
             throw "collection failed with exit code $CollectCode"
+        }
+
+        # The collector's own phases (scan, select, place, reports) when its summary has them.
+        $collectPhases = $null
+        try {
+            $summary = [IO.File]::ReadAllText((Join-Path $Report 'summary.json')) | ConvertFrom-Json
+            $collectPhases = $summary.phases
+        } catch { }
+        if ($collectPhases) {
+            # [[name, seconds], ...] in run order.
+            foreach ($pair in $collectPhases) { Add-Phase ([string] $pair[0]) ([double] $pair[1]) }
+        } else {
+            Add-Phase 'collect' $collectSeconds
         }
 
         $manifestPath = Join-Path $Report 'manifest.sha256'
@@ -492,15 +664,11 @@ try {
             Write-Run 'verifying'
             $verifyArgs = @($Verify, $Out, '--report', $Report)
             if ($CollectCode -eq $ExitCollisions) { $verifyArgs += '--allow-collisions' }
-            & $Python @verifyArgs | Out-Host
-            $VerifyCode = $LASTEXITCODE
+            if ($Jobs) { $verifyArgs += @('--jobs', [string] $Jobs) }
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $VerifyCode = Invoke-Tool $verifyArgs
+            Add-Phase 'verify' $clock.Elapsed.TotalSeconds
         }
-
-        Write-Info "build       $Label"
-        Write-Info "revision    $($source.revision)"
-        Write-Info "files       $manifestLines"
-        Write-Info "corpus      $Out"
-        Write-Info "report      $Report"
 
         if ($VerifyCode -ne $ExitOk) {
             $script:FinalCode = $VerifyCode
@@ -515,19 +683,26 @@ try {
         if ($DeleteSource) {
             if ($script:FinalCode -eq $ExitOk) {
                 if ($DiskPath) {
+                    if ($WimMounted) {
+                        Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction Stop | Out-Null
+                        $WimMounted = $false
+                        Write-Done 'image dismounted'
+                    }
                     Dismount-DiskImage -ImagePath $DiskPath -ErrorAction Stop | Out-Null
                     $DiskPath = ''
+                    Write-Done 'ISO dismounted'
                 }
-                Write-Run "deleting $IsoPath"
                 Remove-Item -LiteralPath $IsoPath -Force
-                Write-Done "deleted $IsoPath"
+                Write-Removed "deleted $IsoPath"
             } else {
                 Write-Skip 'source kept because the run did not pass'
             }
         }
 
-        if ($script:FinalCode -eq $ExitOk) {
-            Write-Done "extract-image: $Label, $manifestLines files, verified"
+        $Result = [ordered]@{
+            files    = $manifestLines
+            revision = $source.revision
+            verified = (-not $NoVerify -and $VerifyCode -eq $ExitOk)
         }
     }
 }
@@ -538,38 +713,51 @@ catch {
     }
 }
 finally {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $cleaned = $false
     if ($WimMounted -and $MountDir) {
         Write-Run 'dismounting image'
         try {
             Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction Stop | Out-Null
+            Write-Done ('image dismounted in {0}' -f (Format-Duration $clock.Elapsed.TotalSeconds))
         } catch {
-            Write-Skip "image dismount failed: $($_.Exception.Message)"
+            Write-Skip "image dismount failed: $($_.Exception.Message); run Clear-WindowsCorruptMountPoint"
         }
+        $cleaned = $true
     }
     if ($DiskPath) {
         try {
             Dismount-DiskImage -ImagePath $DiskPath -ErrorAction Stop | Out-Null
+            Write-Done 'ISO dismounted'
         } catch {
             Write-Skip "ISO dismount failed: $($_.Exception.Message)"
         }
+        $cleaned = $true
     }
     if ($VhdMounted -and $VhdPath) {
         try {
             Dismount-VHD -Path $VhdPath -ErrorAction Stop
+            Write-Done 'VHD dismounted'
         } catch {
             Write-Skip "VHD dismount failed: $($_.Exception.Message)"
         }
+        $cleaned = $true
     }
     if ($MountDir -and (Test-Path -LiteralPath $MountDir)) {
         if (Get-ChildItem -LiteralPath $MountDir -Force | Select-Object -First 1) {
             Write-Skip "mount directory still has content: $MountDir"
         } else {
             Remove-Item -LiteralPath $MountDir -Force -ErrorAction SilentlyContinue
+            $mntRoot = Split-Path -Parent $MountDir
+            if (-not (Get-ChildItem -LiteralPath $mntRoot -Force | Select-Object -First 1)) {
+                Remove-Item -LiteralPath $mntRoot -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     if ($ConvertedWim -and (Test-Path -LiteralPath $ConvertedWim)) {
         try {
             Remove-Item -LiteralPath $ConvertedWim -Force -ErrorAction Stop
+            Write-Removed "temporary WIM $ConvertedWim"
             $tmpDir = Split-Path -Parent $ConvertedWim
             if (-not (Get-ChildItem -LiteralPath $tmpDir -Force | Select-Object -First 1)) {
                 Remove-Item -LiteralPath $tmpDir -Force -ErrorAction SilentlyContinue
@@ -578,6 +766,31 @@ finally {
             Write-Skip "temporary WIM not removed: $ConvertedWim"
         }
     }
+    if ($cleaned) { Add-Phase 'dismount' $clock.Elapsed.TotalSeconds }
+}
+
+# ---- CLOSING LINES ----
+# After the cleanup, so the last line of a run is its result.
+
+if ($Result) {
+    Write-Info "label       $Label"
+    if ($Container) {
+        Write-Info ("image       {0}, {1}, build {2}" -f $Container.imageName, $Container.architecture, $Container.build)
+    }
+    if ($Result.revision) { Write-Info "ntdll       $($Result.revision)" }
+    Write-Info "files       $($Result.files)"
+    Write-Info "corpus      $Out"
+    Write-Info "report      $Report"
+}
+if ($Phases.Count) {
+    Write-Info ('time        ' + (($Phases.Keys | ForEach-Object { '{0} {1}' -f $_, (Format-Duration $Phases[$_]) }) -join ', '))
+}
+$total = Format-Duration $RunClock.Elapsed.TotalSeconds
+if ($script:FinalCode -eq $ExitOk -and $Result) {
+    $how = if ($Result.verified) { 'verified' } else { 'not verified' }
+    Write-Done "extract-image: $Label, $($Result.files) files, $how, in $total"
+} elseif (-not $Listed -or $script:FinalCode -ne $ExitUsage) {
+    Write-Fail "exit code $($script:FinalCode) after $total"
 }
 
 exit $script:FinalCode

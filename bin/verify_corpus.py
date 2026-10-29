@@ -7,6 +7,7 @@ the manifest, so the result means the same on a machine that did not build the c
     python verify_corpus.py <out-dir>                       every check, every file re-hashed
     python verify_corpus.py <out-dir> --fast                existence and sizes only, no re-hash
     python verify_corpus.py <out-dir> --allow-collisions    a non-empty collisions.tsv only warns
+    python verify_corpus.py <out-dir> --jobs 4              hash 4 files at a time
 
 Input
     <out-dir> and its report directory (default <out-dir>/../manifests/<out-name>): manifest.sha256,
@@ -317,6 +318,9 @@ def check_source(checks, source, manifest_path, out, tree):
 # ---- MAIN ----
 
 def main(argv=None):
+    # Line by line even into a pipe (extract-image.ps1, a log file).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(
         prog="verify_corpus.py",
         description="Verify a corpus against its manifest and reports.")
@@ -327,12 +331,17 @@ def main(argv=None):
                     help="existence and sizes only; do not re-hash")
     ap.add_argument("--allow-collisions", action="store_true",
                     help="treat a non-empty collisions.tsv as a warning")
+    ap.add_argument("--jobs", type=int, default=pelib.default_jobs(), metavar="N",
+                    help="files hashed in parallel (default: CPU count, at most %d)"
+                    % pelib.MAX_DEFAULT_JOBS)
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="print only warnings, failures and the closing line")
     ap.add_argument("--version", action="version", version="os-corpus %s" % pelib.VERSION)
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
     out = os.path.abspath(args.out)
+    if args.jobs < 1:
+        return fail("--jobs must be at least 1", EXIT_USAGE)
     if not os.path.isdir(lp(out)):
         return fail("not a directory: %s" % out, EXIT_USAGE)
     report = os.path.abspath(args.report) if args.report else os.path.join(
@@ -370,19 +379,34 @@ def main(argv=None):
         checks.warn("hashes", "skipped (--fast)")
     else:
         bad = []
-        for digest, rel in rows:
-            if rel not in tree:
-                continue
+        present = [(digest, rel) for digest, rel in rows if rel in tree]
+        total_bytes = sum(max(tree[rel], 0) for _, rel in present)
+        done_bytes = 0
+        if not args.quiet:
+            print("[>] re-hashing %d files (%s)" % (len(present), pelib.byte_string(total_bytes)))
+        progress = pelib.Progress(not args.quiet)
+
+        def actual(row):
             try:
-                if pelib.sha256_file(os.path.join(out, rel.replace("/", os.sep))) != digest:
-                    bad.append(rel)
+                return pelib.sha256_file(os.path.join(out, row[1].replace("/", os.sep)))
             except OSError as exc:
-                bad.append("%s (%s)" % (rel, exc))
+                return "(%s)" % exc
+
+        for i, ((digest, rel), result) in enumerate(pelib.ordered_map(actual, present, args.jobs)):
+            progress.tick(lambda: "hashes: %d/%d files (%d%%), %s of %s%s" % (
+                i, len(present), 100 * done_bytes // max(total_bytes, 1),
+                pelib.byte_string(done_bytes), pelib.byte_string(total_bytes),
+                pelib.eta(progress.elapsed(), done_bytes, total_bytes)))
+            done_bytes += max(tree[rel], 0)
+            if result != digest:
+                bad.append(rel if not result.startswith("(") else "%s %s" % (rel, result))
+        progress.clear()
         if bad:
             checks.failed("hashes", "%d mismatch(es), first: %s" % (len(bad), bad[0]),
                           EXIT_MISMATCH)
         else:
-            checks.passed("hashes", "%d verified" % len(rows))
+            checks.passed("hashes", "%d verified in %s"
+                          % (len(present), pelib.duration(progress.elapsed())))
 
     canonical = check_modules(checks, tree, manifest_map,
                               os.path.join(report, "modules.tsv"))

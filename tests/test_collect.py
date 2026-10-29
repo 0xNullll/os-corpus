@@ -107,11 +107,18 @@ class SelectionTests(unittest.TestCase):
     def test_hash_index_forgets_replaced_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "x.dll")
-            index = collect_pes.HashIndex("")
+            index = collect_pes.HashIndex()
             index.record("a" * 64, path, prefer=True)
             index.record("b" * 64, path, prefer=True)
             self.assertIsNone(index.get("a" * 64))
             self.assertEqual(index.get("b" * 64), os.path.normpath(path))
+
+    def test_hash_index_skips_paths_outside_a_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = collect_pes.HashIndex()
+            index.add_build({"../escape.dll": "a" * 64, "C:/x.dll": "b" * 64,
+                             "Windows/ok.dll": "c" * 64}, tmp)
+            self.assertEqual(list(index.by_digest), ["c" * 64])
 
 
 class CollectTests(unittest.TestCase):
@@ -120,8 +127,7 @@ class CollectTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.img = build_image(self.root / "img")
         self.out = self.root / "corpus" / "testbuild"
-        self.report = self.root / "manifests" / "testbuild"
-        self.index = self.root / "corpus" / ".hash-index.tsv"
+        self.report = self.root / "corpus" / "manifests" / "testbuild"
 
     def tearDown(self):
         shutil.rmtree(pelib.long_path(self._tmp.name, True), ignore_errors=True)
@@ -129,7 +135,7 @@ class CollectTests(unittest.TestCase):
 
     def collect(self, *extra, out=None, report=None, img=None):
         return run(COLLECT, img or self.img, out or self.out, "--report", report or self.report,
-                   "--index", self.index, "--label", "testbuild", *extra)
+                   "--label", "testbuild", *extra)
 
     def summary(self, report=None):
         return json.loads(((report or self.report) / "summary.json").read_text(encoding="utf-8"))
@@ -140,6 +146,9 @@ class CollectTests(unittest.TestCase):
         result = self.collect()
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("[+] collect: 9 files stored (8 modules, 1 variants)", result.stdout)
+        for phase in ("[>] scanning ", "[>] selecting: 10 PEs in 8 (name, arch) groups",
+                      "[>] placing 9 files (", "[>] writing reports to "):
+            self.assertIn(phase, result.stdout)
         self.assertEqual(sorted(read_manifest(self.report)), STORED)
 
         summary = self.summary()
@@ -194,6 +203,65 @@ class CollectTests(unittest.TestCase):
         canonical = [(m["path"], m["file_version"]) for m in modules if m["canonical"] == "1"]
         self.assertEqual(canonical, [("Windows/System32/zzz/v.dll", "2.0.0.0")])
 
+    def test_phases_are_recorded_in_run_order(self):
+        result = self.collect()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertEqual([name for name, _ in self.summary()["phases"]],
+                         ["scan", "select", "place", "reports"])
+        self.assertIn("[i] time              scan ", result.stdout)
+
+    def test_jobs_do_not_change_the_result(self):
+        names = ("manifest.sha256", "modules.tsv", "duplicates.tsv", "collisions.tsv")
+        reports = {}
+        for jobs in ("1", "4"):
+            out = self.root / "corpus" / ("jobs" + jobs)
+            report = self.root / "corpus" / "manifests" / ("jobs" + jobs)
+            result = run(COLLECT, self.img, out, "--report", report, "--link-root", "none",
+                         "--jobs", jobs)
+            self.assertEqual(result.returncode, 0, output(result))
+            self.assertIn("[i] jobs     %s" % jobs, result.stdout)
+            reports[jobs] = {n: (report / n).read_bytes() for n in names}
+        self.assertEqual(reports["1"], reports["4"])
+        self.assertEqual(run(COLLECT, self.img, self.out, "--jobs", "0").returncode, 2)
+
+    def _tamper_cache(self, header=None):
+        """Set the cached file version of System32/a.dll to 9.9.9.9 (and optionally the header)."""
+        path = self.report / "scan-cache.tsv"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "#\tos-corpus/scan-cache/2\tinfo/%d" % pelib.INFO_VERSION)
+        if header:
+            lines[0] = header
+        for i, line in enumerate(lines):
+            fields = line.split("\t")
+            if fields[-1] == "Windows/System32/a.dll":
+                info = json.loads(fields[4])
+                info["file_version"] = "9.9.9.9"
+                fields[4] = json.dumps(info, sort_keys=True, separators=(",", ":"))
+                lines[i] = "\t".join(fields)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def a_dll_version(self):
+        _, modules = read_tsv(self.report / "modules.tsv")
+        return next(m["file_version"] for m in modules if m["path"] == "Windows/System32/a.dll")
+
+    def test_resume_reuses_cached_module_info(self):
+        self.collect()
+        self._tamper_cache()
+        result = self.collect("--resume")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("reading versions of 0 (9 cached)", result.stdout)
+        self.assertIn("(0 hashed, 10 reused)", result.stdout)
+        self.assertEqual(self.a_dll_version(), "9.9.9.9")
+
+    def test_cache_of_another_info_version_is_not_trusted(self):
+        self.collect()
+        self._tamper_cache(header="#\tos-corpus/scan-cache/2\tinfo/0")
+        result = self.collect("--resume")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("reading versions of 9 (0 cached)", result.stdout)
+        self.assertEqual(self.a_dll_version(), "")
+
     def test_identical_bytes_are_linked(self):
         self.collect()
         self.assertTrue(same_file(self.out / "Windows/System32/a.dll",
@@ -210,8 +278,8 @@ class CollectTests(unittest.TestCase):
 
     def test_dry_run_writes_nothing(self):
         out = self.root / "corpus" / "dry"
-        report = self.root / "manifests" / "dry"
-        result = run(COLLECT, self.img, out, "--report", report, "--index", "none", "--dry-run")
+        report = self.root / "corpus" / "manifests" / "dry"
+        result = run(COLLECT, self.img, out, "--report", report, "--link-root", "none", "--dry-run")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertIn("dry run, nothing written", result.stdout)
         self.assertFalse(out.exists())
@@ -236,10 +304,51 @@ class CollectTests(unittest.TestCase):
     def test_second_build_reuses_bytes(self):
         self.collect()
         other = self.root / "corpus" / "second"
-        result = self.collect(out=other, report=self.root / "manifests" / "second")
+        result = self.collect(out=other, report=self.root / "corpus" / "manifests" / "second")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertTrue(same_file(other / "Windows/System32/b.dll",
                                   self.out / "Windows/System32/b.dll"))
+        self.assertIn("(1 other build(s), 8 contents indexed)", result.stdout)
+        self.assertEqual(self.summary(self.root / "corpus" / "manifests" / "second")["corpus"],
+                         "second")
+
+    def test_links_survive_moving_the_root(self):
+        self.collect()
+        moved = self.root / "moved"
+        os.rename(self.root / "corpus", moved)
+        result = run(COLLECT, self.img, moved / "second")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(same_file(moved / "second/Windows/System32/b.dll",
+                                  moved / "testbuild/Windows/System32/b.dll"))
+
+    def test_report_named_otherwise_is_still_found(self):
+        # The wrapper names the report after -Label, which may differ from the corpus folder.
+        first = self.root / "corpus" / "b1"
+        self.collect(out=first, report=self.root / "corpus" / "manifests" / "custom")
+        result = run(COLLECT, self.img, self.root / "corpus" / "b2")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertTrue(same_file(self.root / "corpus/b2/Windows/System32/b.dll",
+                                  first / "Windows/System32/b.dll"))
+
+    def test_link_root_none_links_within_the_build_only(self):
+        self.collect()
+        other = self.root / "corpus" / "second"
+        result = run(COLLECT, self.img, other, "--link-root", "none")
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn("[i] link     none", result.stdout)
+        self.assertFalse(same_file(other / "Windows/System32/b.dll",
+                                   self.out / "Windows/System32/b.dll"))
+        self.assertTrue(same_file(other / "Windows/System32/a.dll",
+                                  other / "Windows/System32/dup.dll"))
+
+    def test_obsolete_index_file_is_reported_not_deleted(self):
+        old = self.root / "corpus" / ".hash-index.tsv"
+        old.parent.mkdir(parents=True)
+        old.write_text("", encoding="utf-8")
+        result = self.collect()
+        self.assertEqual(result.returncode, 0, output(result))
+        self.assertIn(".hash-index.tsv is no longer used", result.stdout)
+        self.assertTrue(old.exists())
 
     def test_rewrite_never_touches_another_build(self):
         self.collect()
@@ -250,7 +359,7 @@ class CollectTests(unittest.TestCase):
         (other / "Windows/System32").mkdir(parents=True)
         os.link(self.out / "Windows/System32/b.dll", other / "Windows/System32/b.dll")
         write_pe(self.img / "Windows/System32/b.dll", marker=b"B3")
-        result = self.collect("--force", out=other, report=self.root / "manifests" / "second")
+        result = self.collect("--force", out=other, report=self.root / "corpus" / "manifests" / "second")
         self.assertEqual(result.returncode, 0, output(result))
         self.assertEqual((self.out / "Windows/System32/b.dll").read_bytes(), original)
         self.assertEqual((other / "Windows/System32/b.dll").read_bytes(), pe_bytes(marker=b"B3"))
