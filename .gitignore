@@ -179,3 +179,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# os-corpus working data and media never belong in the tool repo.
+/corpus/
+/manifests/
+/analysis/
+/isos/
+/mnt/
+/.tmp/
+*.iso
+*.img
+*.wim
+*.esd
+*.vhd
+*.vhdx

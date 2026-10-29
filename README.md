@@ -1,2 +1,126 @@
 # os-corpus
 
+Extract a deduplicated PE corpus from Windows installation media (or any
+extracted tree), with the evidence needed to prove exactly what was
+collected, and verify it independently.
+
+Point it at a mounted image. It walks the tree and validates every file as a
+PE by header. It stores each distinct content once and marks one canonical
+file per `(module name, architecture)`. Then it writes a manifest and a
+classified module table, and a second process re-checks all of it. Nothing
+is installed, booted or activated, and there is no hardcoded module list.
+
+```text
+media (ISO / WIM / ESD / VHD)  or  a directory
+        |
+        |  extract-image.ps1   hash, mount read-only, collect, record, verify, dismount
+        v
+  corpus/<build>/Windows/System32/...       every distinct PE, at its image path
+  corpus/manifests/<build>/
+      manifest.sha256                       sha256sum-compatible; the corpus identity
+      modules.tsv                           one classified row per stored file
+      duplicates.tsv                        paths not stored: same name, arch and bytes
+      collisions.tsv                        paths found twice (case-sensitive sources)
+      summary.json                          counts, bytes, histograms
+      source.json                           the media: hash, edition, build (wrapper)
+```
+
+## Scripts
+
+| Script | Role | Does | Elevation |
+|---|---|---|---|
+| `bin/extract-image.ps1` | orchestrator | hashes and mounts the media read-only, runs collect and verify, records `source.json`, always dismounts | ISO, WIM, ESD, VHD |
+| `bin/collect_pes.py` | engine | directory in, corpus and reports out | never |
+| `bin/verify_corpus.py` | check | re-hashes the corpus and cross-checks every report | never |
+| `bin/pelib.py` | library + CLI | PE sniffing, classification, versions, long paths; `pelib.py info <file>` | never |
+
+**[USAGE.md](USAGE.md)** is the full specification of each script: options,
+selection rules, checks, every output column, exit codes and known gaps.
+**[PLAN.md](PLAN.md)** holds the design: invariants, architecture and
+milestones.
+
+## Requirements
+
+- Python 3.9+ (tested on 3.14). Standard library only.
+- Windows with DISM for ISO/WIM/ESD sources; the Hyper-V module for VHD.
+- Administrator for mounting. Collection and verification never need it.
+- A local NTFS volume for the corpus, so identical bytes can be hardlinked.
+
+## Quick start
+
+```powershell
+# 1. list the editions on the media (exits with code 2)
+.\bin\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045
+
+# 2. collect one (Desktop Experience on server media); verification runs automatically
+.\bin\extract-image.ps1 -Iso D:\media\Win10_22H2.iso -Out D:\corpus\10.0.19045 -Index 6
+
+# 3. one file per module and architecture, for consumers that need exactly one
+Import-Csv -Delimiter "`t" D:\corpus\manifests\10.0.19045\modules.tsv |
+    Where-Object canonical -eq 1
+```
+
+An already-mounted or extracted tree needs no wrapper and no elevation:
+
+```powershell
+python .\bin\collect_pes.py D:\mnt\windows D:\corpus\sample
+python .\bin\verify_corpus.py D:\corpus\sample
+```
+
+## What gets collected
+
+- **Every PE, by header.** `.dll`, `.exe`, `.sys`, `.mui`, `.efi`, `.pyd`
+  and extensionless files all qualify when the header is valid. Volatile
+  locations (`$Recycle.Bin`, `WinSxS\Temp`, `SoftwareDistribution` and
+  others) are skipped by default.
+- **Identical bytes once.** The same name, architecture and bytes in
+  several folders are stored at the most authoritative path; the other
+  paths go to `duplicates.tsv`.
+- **Every distinct version.** The same name and architecture with
+  different bytes, such as two WinSxS versions of `comctl32.dll`, are all
+  stored. The best one is `canonical=1`: by location rank
+  (`System32 > SysWOW64 > SystemApps > Program Files > WinSxS > DriverStore > other`),
+  then file version, then path.
+- **Classified.** Each row of `modules.tsv` carries its `kind` (`exe`,
+  `dll`, `native`, `resource`, `efi`), `location`, `clr` (.NET),
+  `embedded_signature`, subsystem and version.
+- **Both architectures from one x64 image.** `System32` is x64 and
+  `SysWOW64` is x86.
+
+Identical binaries are hardlinked across builds through a shared index, so
+a second build costs only the bytes that changed. Re-runs are resumable,
+and reports are rewritten byte for byte.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | error |
+| 2 | bad usage, or an edition listing was requested |
+| 3 | collisions: one path found twice |
+| 4 | verification: content mismatch |
+| 5 | verification: a report disagrees with the manifest |
+| 130 | interrupted |
+
+## Tests
+
+No Windows image is needed, and none is committed. Synthetic PE32/PE32+
+files, version resources and a fake image tree are built in a temporary
+directory, and the real tools run as subprocesses. On Windows that
+includes `extract-image.ps1` with a directory source.
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+| Module | Covers |
+|---|---|
+| `tests/test_pelib.py` | sniffing and malformed headers, classification, versions, long paths, the CLI |
+| `tests/test_collect.py` | locations, selection and collisions as pure functions; collection end to end, re-runs, hardlink safety, deep paths |
+| `tests/test_verify.py` | every failure class against a tampered corpus, the report columns shared with collect |
+| `tests/test_extract_image.py` | the wrapper's directory path and its argument checks |
+
+## License
+
+MIT. See `LICENSE`.
