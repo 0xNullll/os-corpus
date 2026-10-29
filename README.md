@@ -1,5 +1,8 @@
 # os-corpus
 
+[![Windows](https://github.com/0xNullll/os-corpus/actions/workflows/ci-windows.yml/badge.svg?branch=main)](https://github.com/0xNullll/os-corpus/actions/workflows/ci-windows.yml)
+[![Linux](https://github.com/0xNullll/os-corpus/actions/workflows/ci-linux.yml/badge.svg?branch=main)](https://github.com/0xNullll/os-corpus/actions/workflows/ci-linux.yml)
+
 Extract a deduplicated PE corpus from Windows installation media (or any
 extracted tree), with the evidence needed to prove exactly what was
 collected, and verify it independently.
@@ -41,7 +44,7 @@ milestones.
 
 ## Requirements
 
-- Python 3.9+ (tested on 3.14). Standard library only.
+- Python 3.10+ (tested on 3.10, 3.13 and 3.14). Standard library only.
 - Windows with DISM for ISO/WIM/ESD sources; the Hyper-V module for VHD.
 - Administrator for mounting. Collection and verification never need it.
 - A local NTFS volume for the corpus, so identical bytes can be hardlinked.
@@ -113,6 +116,10 @@ includes `extract-image.ps1` with a directory source.
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+CI runs the same suite on Windows and Linux with Python 3.10 and 3.13. It is
+manual: start it from the Actions tab (*Run workflow*); the badges above show
+the latest run on `main`. Real installation media is never mounted in CI.
 
 | Module | Covers |
 |---|---|

@@ -27,9 +27,9 @@ in a log file and in CI.
 | Script | Role | Runs on | Elevation |
 |---|---|---|---|
 | `extract-image.ps1` | orchestrator: hash, mount, collect, record, verify, dismount | Windows (PowerShell 5.1+) | for ISO, WIM, ESD, VHD |
-| `collect_pes.py` | engine: directory in, corpus and reports out | any OS, Python 3.9+ | never |
-| `verify_corpus.py` | independent check of a finished corpus | any OS, Python 3.9+ | never |
-| `pelib.py` | shared PE primitives, plus a one-file inspection CLI | any OS, Python 3.9+ | never |
+| `collect_pes.py` | engine: directory in, corpus and reports out | any OS, Python 3.10+ | never |
+| `verify_corpus.py` | independent check of a finished corpus | any OS, Python 3.10+ | never |
+| `pelib.py` | shared PE primitives, plus a one-file inspection CLI | any OS, Python 3.10+ | never |
 
 The Python scripts use the standard library only and find each other
 through their own folder, so `bin/` must stay together.

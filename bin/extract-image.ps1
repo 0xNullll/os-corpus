@@ -174,8 +174,18 @@ function Get-PeRevision([string] $DllPath) {
     return [string] (Get-Item -LiteralPath $DllPath).VersionInfo.FileVersion
 }
 
+# .NET instead of Get-FileHash. In Windows PowerShell 5.1, Get-FileHash is a script function of
+# the Utility module, and it is missing when powershell.exe inherits PowerShell 7's PSModulePath
+# (started from a pwsh session, such as the default shell of GitHub Actions).
 function Get-FileSha256([string] $Path) {
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
 }
 
 # The DISM description of one image, as recorded in source.json.

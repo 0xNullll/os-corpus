@@ -15,7 +15,7 @@ behaves, every option and every output column are specified in
 [USAGE.md](USAGE.md).
 
 - Version: 0.1.0
-- Runtime: Python 3.9+ (3.14 tested), standard library only
+- Runtime: Python 3.10+ (3.10, 3.13 and 3.14 tested), standard library only
 - Host: Windows for ISO/WIM/ESD/VHD sources; any OS for directory sources
 - License: MIT
 

@@ -28,6 +28,20 @@ def wrapper(*args):
                           capture_output=True, text=True)
 
 
+class PortabilityTests(unittest.TestCase):
+    # Script functions of Windows PowerShell 5.1's Utility module. They are missing when
+    # powershell.exe inherits PowerShell 7's PSModulePath, which is how GitHub Actions starts it,
+    # so the wrapper must not call them (Get-FileHash failed CI that way).
+    SCRIPT_FUNCTIONS = ("Get-FileHash", "New-TemporaryFile", "New-Guid", "Format-Hex",
+                        "Import-PowerShellDataFile", "ConvertFrom-SddlString")
+
+    def test_no_utility_script_functions(self):
+        code = "\n".join(line.split("#", 1)[0]
+                         for line in Path(WRAPPER).read_text(encoding="utf-8").splitlines())
+        for name in self.SCRIPT_FUNCTIONS:
+            self.assertNotIn(name.lower(), code.lower(), name)
+
+
 @unittest.skipUnless(POWERSHELL, "Windows PowerShell not available")
 class WrapperTests(unittest.TestCase):
     def setUp(self):

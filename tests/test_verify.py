@@ -51,7 +51,10 @@ class VerifyTests(unittest.TestCase):
 
     def edit(self, name, change):
         path = self.report / name
-        path.write_text(change(path.read_text(encoding="utf-8")), encoding="utf-8", newline="\n")
+        text = change(path.read_text(encoding="utf-8"))
+        # Path.write_text has no newline argument before Python 3.10.
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
 
     # -- passing -----------------------------------------------------------
 

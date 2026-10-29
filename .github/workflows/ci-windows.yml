@@ -1,0 +1,40 @@
+name: os-corpus CI (Windows)
+
+# Manual only: run it from the Actions tab (Run workflow) or `gh workflow run ci-windows.yml`.
+on:
+  workflow_dispatch:
+    inputs:
+      python:
+        description: "Python versions to test"
+        type: choice
+        options:
+          - both
+          - oldest
+          - newest
+        default: both
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: windows / py${{ matrix.python }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # oldest = the minimum USAGE.md promises, newest = the current release line.
+        python: ${{ fromJSON(inputs.python == 'oldest' && '["3.10"]' || inputs.python == 'newest' && '["3.13"]' || '["3.10", "3.13"]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Includes tests/test_extract_image.py: the wrapper with a directory source (no
+      # elevation, no media). Mounting real ISO/WIM/ESD/VHD media is never run in CI.
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
